@@ -818,38 +818,44 @@ def send_file_reliable(sock, peer, cipher, filepath, filesize, filehash,
     meta_deadline = meta_start + connect_timeout
     last_print   = 0.0
 
-    while time.time() < meta_deadline:
-        try:
-            sock.sendto(cipher.encrypt(T_META, meta), peer)
-        except OSError:
-            pass
-
-        try:
-            ready = select.select([sock], [], [], 0.5)
-        except OSError:
-            continue
-
-        if ready[0]:
+    try:
+        while time.time() < meta_deadline:
             try:
-                raw, _ = sock.recvfrom(RECV_BUF)
+                sock.sendto(cipher.encrypt(T_META, meta), peer)
             except OSError:
-                # On Windows, sending to a closed local port generates an
-                # ICMP port-unreachable that surfaces as WinError 10054 on
-                # the next recvfrom.  Swallow it and keep retrying META.
-                continue
-            ptype, pl = cipher.decrypt(raw)
-            if ptype == T_ACK:
-                meta_acked = True
-                break
-            if ptype == T_ABORT:
-                meta_declined = True
-                break
+                pass
 
-        elapsed = time.time() - meta_start
-        if elapsed - last_print >= 30:
-            last_print = elapsed
-            sys.stdout.write(f"\r  Waiting for receiver... {int(elapsed)}s  ")
-            sys.stdout.flush()
+            try:
+                ready = select.select([sock], [], [], 0.5)
+            except OSError:
+                continue
+
+            if ready[0]:
+                try:
+                    raw, _ = sock.recvfrom(RECV_BUF)
+                except OSError:
+                    # On Windows, sending to a closed local port generates an
+                    # ICMP port-unreachable that surfaces as WinError 10054 on
+                    # the next recvfrom.  Swallow it and keep retrying META.
+                    continue
+                ptype, pl = cipher.decrypt(raw)
+                if ptype == T_ACK:
+                    meta_acked = True
+                    break
+                if ptype == T_ABORT:
+                    meta_declined = True
+                    break
+
+            elapsed = time.time() - meta_start
+            if elapsed - last_print >= 30:
+                last_print = elapsed
+                sys.stdout.write(f"\r  Waiting for receiver... {int(elapsed)}s  ")
+                sys.stdout.flush()
+
+    except KeyboardInterrupt:
+        print("\n  Cancelled.")
+        _send_abort_signal(sock, cipher, peer, "CANCEL")
+        return False
 
     if meta_declined:
         print("\n  Receiver declined the transfer.")
@@ -893,7 +899,9 @@ def send_file_reliable(sock, peer, cipher, filepath, filesize, filehash,
         return chunk_cache[seq]
 
     last_acked_count  = 0
-    last_progress_t   = time.time()
+    # None until the first packet is sent; prevents the stall timer from
+    # firing before any data has left the socket.
+    last_progress_t   = None
 
     try:
         while len(acked) < total_chunks:
@@ -905,7 +913,7 @@ def send_file_reliable(sock, peer, cipher, filepath, filesize, filehash,
             if len(acked) > last_acked_count:
                 last_acked_count = len(acked)
                 last_progress_t  = now
-            elif now - last_progress_t > STALL_TIMEOUT:
+            elif last_progress_t is not None and now - last_progress_t > STALL_TIMEOUT:
                 print(f"\n  Transfer stalled -- no progress for {STALL_TIMEOUT}s. "
                       f"Receiver may have disconnected.")
                 return False
@@ -918,11 +926,17 @@ def send_file_reliable(sock, peer, cipher, filepath, filesize, filehash,
                 _send_data_pkt(sock, peer, cipher, next_seq, _get_chunk(next_seq))
                 sent_time[next_seq] = now
                 retries.setdefault(next_seq, 0)
+                if last_progress_t is None:
+                    last_progress_t = now   # arm stall timer on first send
                 next_seq += 1
 
             # ---- Retransmit timed-out packets --------------------------------
+            # Also prunes acked entries so the scan stays O(in-flight),
+            # not O(total-chunks-ever-sent) -- critical for large files.
             for seq in list(sent_time):
                 if seq in acked:
+                    del sent_time[seq]
+                    retries.pop(seq, None)
                     continue
                 if now - sent_time[seq] > ACK_TIMEOUT:
                     retries[seq] += 1
@@ -977,28 +991,39 @@ def send_file_reliable(sock, peer, cipher, filepath, filesize, filehash,
     # ---- Signal completion --------------------------------------------------
     done_pkt      = cipher.encrypt(T_DONE, b"DONE")
     done_deadline = time.time() + DONE_TIMEOUT
-    while time.time() < done_deadline:
-        try:
-            sock.sendto(done_pkt, peer)
-        except OSError:
-            pass
-        try:
-            ready = select.select([sock], [], [], 0.5)
-        except OSError:
-            continue
-        if ready[0]:
+    got_doneack   = False
+    try:
+        while time.time() < done_deadline:
             try:
-                raw, _ = sock.recvfrom(RECV_BUF)
+                sock.sendto(done_pkt, peer)
+            except OSError:
+                pass
+            try:
+                ready = select.select([sock], [], [], 0.5)
             except OSError:
                 continue
-            ptype, _ = cipher.decrypt(raw)
-            if ptype == T_DONEACK:
-                break
-            if ptype == T_ABORT:
-                print("\n  Receiver cancelled the transfer.")
-                return False
+            if ready[0]:
+                try:
+                    raw, _ = sock.recvfrom(RECV_BUF)
+                except OSError:
+                    continue
+                ptype, _ = cipher.decrypt(raw)
+                if ptype == T_DONEACK:
+                    got_doneack = True
+                    break
+                if ptype == T_ABORT:
+                    print("\n  Receiver cancelled the transfer.")
+                    return False
+    except KeyboardInterrupt:
+        print("\n  Cancelled.")
+        _send_abort_signal(sock, cipher, peer, "CANCEL")
+        return False
 
     print(f"\r  Progress: 100%  ({_fmt(filesize)} / {_fmt(filesize)})")
+    if not got_doneack:
+        print("  Warning: receiver did not acknowledge completion "
+              f"(no DONEACK within {DONE_TIMEOUT}s). "
+              "The file was fully transferred but the receiver may still be processing.")
     return True
 
 
@@ -1046,6 +1071,10 @@ def recv_file_reliable(sock, peer, cipher, connect_timeout=CONNECT_TIMEOUT):
         ptype, payload = cipher.decrypt(raw)
         if ptype == T_HELLO:
             pass   # late punch reply -- ignore (DH already done)
+        elif ptype == T_ABORT:
+            reason = payload[:200].decode("utf-8", "replace") if payload else "ABORT"
+            print(f"\n  Sender cancelled before transfer started ({reason}).")
+            return None
         elif ptype == T_META and payload:
             try:
                 meta = json.loads(payload)
@@ -1104,6 +1133,7 @@ def recv_file_reliable(sock, peer, cipher, connect_timeout=CONNECT_TIMEOUT):
     if total_chunks == 0:
         try:
             tmp = tempfile.NamedTemporaryFile(delete=False, dir=".")
+            os.chmod(tmp.name, 0o600)
             tmp.close()
         except OSError as e:
             print(f"\n  Cannot create temp file: {e}")
@@ -1113,6 +1143,7 @@ def recv_file_reliable(sock, peer, cipher, connect_timeout=CONNECT_TIMEOUT):
     # ---- Receive DATA chunks, stream to temp file ---------------------------
     try:
         tmp = tempfile.NamedTemporaryFile(delete=False, dir=".")
+        os.chmod(tmp.name, 0o600)
     except OSError as e:
         print(f"\n  Cannot create temp file: {e}")
         return None
@@ -1208,6 +1239,16 @@ def recv_file_reliable(sock, peer, cipher, connect_timeout=CONNECT_TIMEOUT):
                     )
                 except OSError:
                     pass
+
+            elif ptype == T_ABORT:
+                reason = payload[:200].decode("utf-8", "replace") if payload else "ABORT"
+                print(f"\n  Sender cancelled the transfer ({reason}).")
+                tmp.close()
+                try:
+                    os.unlink(tmp.name)
+                except OSError:
+                    pass
+                return None
 
         # ---- Finalize the temp file -----------------------------------------
         try:
@@ -1337,13 +1378,16 @@ def cmd_send(filepath, connect_timeout=CONNECT_TIMEOUT):
     pub = stun_discover(sock)
     if pub:
         pub_ip, pub_port = pub
-        print(f"  Public : {pub_ip}:{pub_port}")
+        try:
+            socket.inet_aton(pub_ip)   # guard: only IPv4 is supported in codes
+            print(f"  Public : {pub_ip}:{pub_port}")
+        except OSError:
+            pub_ip, pub_port = local_ip, local_port
+            print("  STUN returned a non-IPv4 address -- using local address.")
     else:
         pub_ip, pub_port = local_ip, local_port
         print("  STUN failed -- using local address (LAN-only transfer).")
     print(f"  Local  : {local_ip}:{local_port}")
-
-    # ---- Generate secret, salt & SEND CODE ----------------------------------
     secret = secrets.token_bytes(16)
     salt   = secrets.token_bytes(16)
     code   = encode_sender_code(secret, salt, pub_ip, pub_port, local_ip, local_port)
@@ -1451,7 +1495,12 @@ def cmd_recv(connect_timeout=CONNECT_TIMEOUT):
     pub = stun_discover(sock)
     if pub:
         pub_ip, pub_port = pub
-        print(f"  Public : {pub_ip}:{pub_port}")
+        try:
+            socket.inet_aton(pub_ip)   # guard: only IPv4 is supported in codes
+            print(f"  Public : {pub_ip}:{pub_port}")
+        except OSError:
+            pub_ip, pub_port = local_ip, local_port
+            print("  STUN returned a non-IPv4 address -- using local address.")
     else:
         pub_ip, pub_port = local_ip, local_port
         print("  STUN failed -- using local address (LAN-only transfer).")

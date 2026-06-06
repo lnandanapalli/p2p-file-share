@@ -22,6 +22,17 @@ python p2p.py recv
 
 Paste the sender's code when prompted. You'll get a recv code (23 words) -- give that back to the sender. Once both codes are exchanged, the transfer starts automatically.
 
+**Optional timeout control:**
+
+By default, both sides wait up to 1 hour during the code-exchange and hole-punch phases. If your users are slow to exchange codes, you can increase it:
+
+```
+python p2p.py send photo.jpg --connect-timeout 7200
+python p2p.py recv --connect-timeout 7200
+```
+
+The `--connect-timeout` parameter (in seconds) controls how long both sides wait during the hole-punch and initial handshake. The file transfer itself has no time limit (only packet-loss retries apply).
+
 The file saves to the current directory.
 
 ## How it works
@@ -67,8 +78,10 @@ The shared secret (128 bits, from `secrets.token_bytes`) travels inside the send
 | Max file size | 4 GB |
 | Chunk size | 1400 bytes (fits typical MTU) |
 | Send window | 32 packets |
-| Hole punch timeout | 60 seconds |
+| Connection timeout | 3600 seconds (1 hour)* |
 | Per-packet retries | 200 |
+
+*Covers hole-punch, code exchange, and handshake phases. Override with `--connect-timeout`.
 
 These are constants near the top of the file. Adjust them if needed.
 

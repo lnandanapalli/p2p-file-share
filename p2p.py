@@ -7,8 +7,13 @@ Works behind most NATs (full-cone, address-restricted, port-restricted).
 Symmetric NATs may fail without a relay -- that's a hard networking limit.
 
 Usage:
-    python p2p.py send <file>          Send a file
-    python p2p.py recv                 Receive a file (saves to current dir)
+    python p2p.py send <file> [--connect-timeout SECONDS]
+    python p2p.py recv        [--connect-timeout SECONDS]
+
+  --connect-timeout controls how long (in seconds) both sides will wait
+  during the hole-punch and initial handshake phases.  Default is 3600s
+  (1 hour) so users have plenty of time to exchange codes out-of-band.
+  The transfer itself has no time limit -- only packet-loss retries apply.
 
 Flow:
     1. Sender runs 'send', gets a SEND CODE.
@@ -66,8 +71,11 @@ CHUNK_SIZE = 1400  # bytes per DATA packet payload (fits typical MTU)
 WINDOW_SIZE = 32  # max unACKed in-flight packets
 ACK_TIMEOUT = 0.5  # seconds before retransmitting a packet
 MAX_RETRIES = 200  # per-packet retransmit limit
-PUNCH_TIMEOUT = 60  # seconds to attempt hole punching
+CONNECT_TIMEOUT = 3600  # seconds for all connection-phase waits:
+                        #   hole-punch, META send/ACK (both sides)
+                        #   overridable via --connect-timeout
 PUNCH_INTERVAL = 0.25  # seconds between HELLO salvos
+DONE_TIMEOUT = 60       # seconds for DONE/DONEACK at end of transfer
 MAX_FILE_SIZE = 4 * 1024 * 1024 * 1024  # 4 GB receive limit
 
 # Packet types
@@ -652,7 +660,7 @@ def decode_recv_code(code, secret):
 
 
 def punch_hole(sock, cipher, pub_addr, local_addr, dh_pub_bytes,
-               timeout=PUNCH_TIMEOUT):
+               timeout=CONNECT_TIMEOUT):
     """
     Simultaneously send encrypted HELLOs (carrying our DH public key) to
     the peer's public and local endpoints until one replies with theirs.
@@ -705,7 +713,10 @@ def punch_hole(sock, cipher, pub_addr, local_addr, dh_pub_bytes,
                 pass
 
         elapsed = int(time.time() - start)
-        sys.stdout.write(f"\r  Punching through NAT... {elapsed}s  ")
+        if elapsed >= 60:
+            sys.stdout.write(f"\r  Punching through NAT... {elapsed // 60}m {elapsed % 60}s  ")
+        else:
+            sys.stdout.write(f"\r  Punching through NAT... {elapsed}s  ")
         sys.stdout.flush()
 
     print("\n  Hole punch timed out.")
@@ -722,26 +733,37 @@ def _send_data_pkt(sock, peer, cipher, seq, chunk):
     sock.sendto(cipher.encrypt(T_DATA, payload), peer)
 
 
-def send_file_reliable(sock, peer, cipher, filepath, filesize, filehash):
+def send_file_reliable(sock, peer, cipher, filepath, filesize, filehash,
+                       connect_timeout=CONNECT_TIMEOUT):
     """Read file in chunks and send with windowed retransmission."""
     total_chunks = math.ceil(filesize / CHUNK_SIZE) if filesize > 0 else 0
 
-    # -- send META until ACKed --
+    # -- send META until ACKed (time-based deadline, not a loop count) --
     meta = json.dumps(
         {"name": os.path.basename(filepath), "size": filesize, "hash": filehash}
     ).encode()
     meta_acked = False
-    for attempt in range(30):
+    meta_start = time.time()
+    meta_deadline = meta_start + connect_timeout
+    last_print = 0.0
+    while time.time() < meta_deadline:
         sock.sendto(cipher.encrypt(T_META, meta), peer)
-        ready = select.select([sock], [], [], 0.4)
+        ready = select.select([sock], [], [], 0.5)
         if ready[0]:
             raw, _ = sock.recvfrom(RECV_BUF)
             ptype, pl = cipher.decrypt(raw)
             if ptype == T_ACK:
                 meta_acked = True
                 break
+        elapsed = time.time() - meta_start
+        if elapsed - last_print >= 30:
+            last_print = elapsed
+            sys.stdout.write(
+                f"\r  Waiting for receiver... {int(elapsed)}s  "
+            )
+            sys.stdout.flush()
     if not meta_acked:
-        print("  Failed to deliver file metadata.")
+        print("\n  Failed to deliver file metadata -- receiver never responded.")
         return False
 
     if total_chunks == 0:
@@ -821,11 +843,12 @@ def send_file_reliable(sock, peer, cipher, filepath, filesize, filehash):
     finally:
         fh.close()
 
-    # -- send DONE --
+    # -- send DONE (time-based deadline) --
     done_pkt = cipher.encrypt(T_DONE, b"DONE")
-    for _ in range(20):
+    done_deadline = time.time() + DONE_TIMEOUT
+    while time.time() < done_deadline:
         sock.sendto(done_pkt, peer)
-        ready = select.select([sock], [], [], 0.15)
+        ready = select.select([sock], [], [], 0.5)
         if ready[0]:
             raw, _ = sock.recvfrom(RECV_BUF)
             ptype, _ = cipher.decrypt(raw)
@@ -836,18 +859,27 @@ def send_file_reliable(sock, peer, cipher, filepath, filesize, filehash):
     return True
 
 
-def recv_file_reliable(sock, peer, cipher):
+def recv_file_reliable(sock, peer, cipher, connect_timeout=CONNECT_TIMEOUT):
     """Receive a file, streaming chunks to a temp file.
     Returns (filename, temp_path, expected_hash) or None."""
 
-    # -- wait for META --
-    print("  Waiting for file info...")
+    # -- wait for META (time-based deadline) --
+    print("  Waiting for file info (sender may still be setting up)...")
     meta = None
     t0 = time.time()
+    deadline = t0 + connect_timeout
+    last_print = 0.0
     while meta is None:
-        if time.time() - t0 > 60:
-            print("  Timed out waiting for metadata.")
+        if time.time() > deadline:
+            print("\n  Timed out waiting for metadata.")
             return None
+        elapsed = time.time() - t0
+        if elapsed - last_print >= 30:
+            last_print = elapsed
+            mins, secs = divmod(int(elapsed), 60)
+            label = f"{mins}m {secs}s" if mins else f"{secs}s"
+            sys.stdout.write(f"\r  Still waiting for sender... {label}  ")
+            sys.stdout.flush()
         ready = select.select([sock], [], [], 2.0)
         if not ready[0]:
             continue
@@ -1020,7 +1052,7 @@ BANNER = r"""
 """
 
 
-def cmd_send(filepath):
+def cmd_send(filepath, connect_timeout=CONNECT_TIMEOUT):
     if not os.path.isfile(filepath):
         print(f"  Error: '{filepath}' not found.")
         sys.exit(1)
@@ -1103,6 +1135,7 @@ def cmd_send(filepath):
         (peer_pub_ip, peer_pub_port),
         (peer_local_ip, peer_local_port),
         dh_pub,
+        timeout=connect_timeout,
     )
     if not peer:
         print("  Could not establish a connection. The NAT(s) may be too strict.")
@@ -1115,7 +1148,10 @@ def cmd_send(filepath):
     session_cipher = Cipher(secret + dh_shared, salt, is_sender=True)
 
     # Transfer
-    ok = send_file_reliable(sock, peer, session_cipher, filepath, filesize, filehash)
+    ok = send_file_reliable(
+        sock, peer, session_cipher, filepath, filesize, filehash,
+        connect_timeout=connect_timeout,
+    )
     sock.close()
 
     if ok:
@@ -1125,7 +1161,7 @@ def cmd_send(filepath):
         sys.exit(1)
 
 
-def cmd_recv():
+def cmd_recv(connect_timeout=CONNECT_TIMEOUT):
     save_dir = "."
 
     # Bind
@@ -1199,6 +1235,7 @@ def cmd_recv():
         (peer_pub_ip, peer_pub_port),
         (peer_local_ip, peer_local_port),
         dh_pub,
+        timeout=connect_timeout,
     )
     if not peer:
         print("  Could not establish a connection. The NAT(s) may be too strict.")
@@ -1211,7 +1248,8 @@ def cmd_recv():
     session_cipher = Cipher(secret + dh_shared, salt, is_sender=False)
 
     # Receive
-    result = recv_file_reliable(sock, peer, session_cipher)
+    result = recv_file_reliable(sock, peer, session_cipher,
+                                connect_timeout=connect_timeout)
     sock.close()
 
     if result is None:
@@ -1243,21 +1281,49 @@ def main():
 
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
         print("  Usage:")
-        print("    python p2p.py send <file>")
-        print("    python p2p.py recv")
+        print("    python p2p.py send <file> [--connect-timeout SECONDS]")
+        print("    python p2p.py recv        [--connect-timeout SECONDS]")
+        print()
+        print("  --connect-timeout  Seconds to wait during hole-punch and")
+        print(f"                     handshake phases (default: {CONNECT_TIMEOUT}).")
+        print("                     Increase if users are slow to exchange codes.")
         print()
         sys.exit(0)
 
-    cmd = sys.argv[1].lower()
+    # Parse optional --connect-timeout N (works anywhere after the subcommand)
+    args = sys.argv[1:]
+    connect_timeout = CONNECT_TIMEOUT
+    filtered = []
+    i = 0
+    while i < len(args):
+        if args[i] == "--connect-timeout" and i + 1 < len(args):
+            try:
+                connect_timeout = int(args[i + 1])
+                if connect_timeout <= 0:
+                    raise ValueError
+            except ValueError:
+                print(f"  Error: --connect-timeout must be a positive integer.")
+                sys.exit(1)
+            i += 2
+        else:
+            filtered.append(args[i])
+            i += 1
+    args = filtered
+
+    if not args:
+        print("  Use 'send' or 'recv'.  Run with -h for help.")
+        sys.exit(1)
+
+    cmd = args[0].lower()
 
     if cmd == "send":
-        if len(sys.argv) < 3:
+        if len(args) < 2:
             print("  Usage: python p2p.py send <file>")
             sys.exit(1)
-        cmd_send(sys.argv[2])
+        cmd_send(args[1], connect_timeout=connect_timeout)
 
     elif cmd in ("recv", "receive"):
-        cmd_recv()
+        cmd_recv(connect_timeout=connect_timeout)
 
     else:
         print(f"  Unknown command: {cmd}")

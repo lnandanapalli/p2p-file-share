@@ -20,7 +20,7 @@ You'll get a send code (36 words). Give it to the receiver over any channel -- t
 python p2p.py recv
 ```
 
-Paste the sender's code when prompted. You'll get a recv code (23 words) -- give that back to the sender. Once both codes are exchanged, the transfer starts automatically.
+Paste the sender's code when prompted. You'll get a recv code (23 words) -- give that back to the sender. Once both codes are exchanged, you'll see the filename and file size. Accept or decline the transfer. If accepted, the encrypted transfer begins automatically.
 
 **Optional timeout control:**
 
@@ -41,8 +41,13 @@ The file saves to the current directory.
 2. Addresses and a shared secret are packed into human-readable word codes (BIP39 subset, 1024 words).
 3. Both sides simultaneously send UDP packets to each other's public and local addresses until one gets through (hole punching).
 4. An ephemeral Diffie-Hellman key exchange happens during the punch for forward secrecy.
-5. The file is sent over a reliable transport layer (selective-repeat ARQ with windowed retransmission) on top of UDP.
-6. Everything on the wire is encrypted and authenticated per-packet.
+5. The sender's metadata (filename, file size, hash) is sent to the receiver.
+6. The receiver sees the filename and file size, then accepts or declines the transfer.
+7. If accepted, the file is sent over a reliable transport layer (selective-repeat ARQ with windowed retransmission) on top of UDP.
+8. Everything on the wire is encrypted and authenticated per-packet.
+
+If the receiver declines the transfer, both sides are notified and the connection closes gracefully. The sender can then cancel and start a new transfer to a different receiver.
+
 
 ## NAT compatibility
 

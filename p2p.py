@@ -21,7 +21,9 @@ Flow:
     3. Receiver runs 'recv', pastes the send code, gets a RECV CODE.
     4. Receiver shares the recv code back to the sender.
     5. Sender pastes the recv code.
-    6. Both sides punch through NAT and transfer the file, encrypted.
+    6. Both sides punch through NAT.
+    7. Receiver sees file name and size, then accepts or declines.
+    8. If accepted, the encrypted transfer begins.
 
 Crypto:
     - 128-bit random secret (embedded in the send code)
@@ -54,6 +56,7 @@ import json
 import math
 import tempfile
 import shutil
+import traceback
 
 # ===============================================================================
 # Configuration
@@ -67,27 +70,88 @@ STUN_SERVERS = [
     ("stun4.l.google.com", 19302),
 ]
 
-CHUNK_SIZE = 1400  # bytes per DATA packet payload (fits typical MTU)
-WINDOW_SIZE = 32  # max unACKed in-flight packets
-ACK_TIMEOUT = 0.5  # seconds before retransmitting a packet
-MAX_RETRIES = 200  # per-packet retransmit limit
-CONNECT_TIMEOUT = 3600  # seconds for all connection-phase waits:
-                        #   hole-punch, META send/ACK (both sides)
-                        #   overridable via --connect-timeout
-PUNCH_INTERVAL = 0.25  # seconds between HELLO salvos
-DONE_TIMEOUT = 60       # seconds for DONE/DONEACK at end of transfer
-MAX_FILE_SIZE = 4 * 1024 * 1024 * 1024  # 4 GB receive limit
+CHUNK_SIZE = 1400   # bytes per DATA packet payload (fits typical MTU)
+WINDOW_SIZE = 32    # max unACKed in-flight packets
+ACK_TIMEOUT = 0.5   # seconds before retransmitting a packet
+MAX_RETRIES = 200   # per-packet retransmit limit
+CONNECT_TIMEOUT = 3600   # seconds for all connection-phase waits
+PUNCH_INTERVAL = 0.25    # seconds between HELLO salvos
+DONE_TIMEOUT = 60        # seconds for DONE/DONEACK at end of transfer
+STALL_TIMEOUT = 120      # seconds without progress before declaring transfer dead
+MAX_FILE_SIZE = 4 * 1024 * 1024 * 1024   # 4 GB receive limit
 
 # Packet types
-T_HELLO = 1
-T_META = 2
-T_DATA = 3
-T_ACK = 4
-T_DONE = 5
+T_HELLO   = 1
+T_META    = 2
+T_DATA    = 3
+T_ACK     = 4
+T_DONE    = 5
 T_DONEACK = 6
+T_ABORT   = 7   # receiver declined or cancelled
 
 # Receive buffer (UDP max)
 RECV_BUF = 65536
+
+
+# ===============================================================================
+# Error handling helpers
+# ===============================================================================
+
+def _die(msg, sock=None, code=1):
+    """Print a clean error message and exit.  Never shows a traceback."""
+    if sock is not None:
+        try:
+            sock.close()
+        except OSError:
+            pass
+    print(f"\n  Error: {msg}")
+    sys.exit(code)
+
+
+def _send_abort_signal(sock, cipher, peer, reason="ABORT", tries=6, delay=0.05):
+    """Best-effort authenticated abort notification."""
+    if not peer:
+        return
+    try:
+        pkt = cipher.encrypt(T_ABORT, reason.encode("utf-8", "replace"))
+    except Exception:
+        return
+    for _ in range(tries):
+        try:
+            sock.sendto(pkt, peer)
+        except OSError:
+            pass
+        time.sleep(delay)
+
+
+def _drain_socket(sock):
+    """
+    Discard every datagram already sitting in the OS receive buffer.
+
+    Why this matters
+    ----------------
+    The receiver starts hole-punching (and therefore fires HELLO packets
+    at the sender's port) the moment it displays its RECV CODE -- before
+    the user has even copied that code to the sender.  If the receiver
+    then cancels and restarts on a new port, those early HELLOs are still
+    sitting in the sender's socket buffer.  Without this drain, punch_hole()
+    would read one of those stale HELLOs, "connect" to the now-dead first
+    port, derive the wrong DH shared secret, and send META to a closed
+    port -- causing ConnectionResetError (WinError 10054) on Windows and a
+    silent stall on the receiver side.
+
+    Draining right before punch_hole() ensures only packets that arrive
+    *after* the user has actually exchanged both codes are considered.
+    The addr-filter inside punch_hole() provides a second layer of defence.
+    """
+    sock.setblocking(False)
+    try:
+        while True:
+            sock.recvfrom(RECV_BUF)
+    except OSError:
+        pass
+    finally:
+        sock.setblocking(True)
 
 
 # ===============================================================================
@@ -106,7 +170,10 @@ def _stun_transact(sock, server):
     except OSError:
         return None
 
-    ready = select.select([sock], [], [], 2.0)
+    try:
+        ready = select.select([sock], [], [], 2.0)
+    except OSError:
+        return None
     if not ready[0]:
         return None
 
@@ -118,9 +185,9 @@ def _stun_transact(sock, server):
     if len(data) < 20:
         return None
     msg_type, msg_len = struct.unpack("!HH", data[:4])
-    if msg_type != 0x0101:  # not Binding Success
+    if msg_type != 0x0101:
         return None
-    if data[8:20] != txn_id:  # transaction ID mismatch -- possible spoof
+    if data[8:20] != txn_id:
         return None
 
     pos = 20
@@ -130,19 +197,19 @@ def _stun_transact(sock, server):
         if len(aval) < alen:
             break
 
-        if atype == 0x0020 and alen >= 8:  # XOR-MAPPED-ADDRESS
-            if aval[1] == 0x01:  # IPv4
+        if atype == 0x0020 and alen >= 8:   # XOR-MAPPED-ADDRESS
+            if aval[1] == 0x01:             # IPv4
                 xport = struct.unpack("!H", aval[2:4])[0] ^ (_STUN_MAGIC >> 16)
-                xip = struct.unpack("!I", aval[4:8])[0] ^ _STUN_MAGIC
+                xip   = struct.unpack("!I", aval[4:8])[0] ^ _STUN_MAGIC
                 return socket.inet_ntoa(struct.pack("!I", xip)), xport
 
         elif atype == 0x0001 and alen >= 8:  # MAPPED-ADDRESS (fallback)
             if aval[1] == 0x01:
                 port = struct.unpack("!H", aval[2:4])[0]
-                ip = socket.inet_ntoa(aval[4:8])
+                ip   = socket.inet_ntoa(aval[4:8])
                 return ip, port
 
-        pos += 4 + alen + ((4 - alen % 4) % 4)  # STUN attr padding
+        pos += 4 + alen + ((4 - alen % 4) % 4)
     return None
 
 
@@ -186,41 +253,28 @@ class Cipher:
     """
 
     def __init__(self, secret: bytes, salt: bytes, is_sender: bool):
-        km = hashlib.pbkdf2_hmac(
-            "sha256", secret, salt, 100_000, dklen=128
-        )
-        # First 64 bytes  -> sender-to-receiver keys
-        # Second 64 bytes -> receiver-to-sender keys
-        s2r_enc, s2r_mac = km[:32], km[32:64]
+        km = hashlib.pbkdf2_hmac("sha256", secret, salt, 100_000, dklen=128)
+        s2r_enc, s2r_mac = km[:32],   km[32:64]
         r2s_enc, r2s_mac = km[64:96], km[96:128]
 
         if is_sender:
-            self._ek, self._mk = s2r_enc, s2r_mac
+            self._ek, self._mk  = s2r_enc, s2r_mac
             self._dk, self._dmk = r2s_enc, r2s_mac
         else:
-            self._ek, self._mk = r2s_enc, r2s_mac
+            self._ek, self._mk  = r2s_enc, r2s_mac
             self._dk, self._dmk = s2r_enc, s2r_mac
 
-        self._ctr = 0  # send counter (nonce)
-        # Replay protection: sliding window over received nonce counters.
-        # We track the highest nonce seen (_max_nonce) and a set of seen
-        # nonces within a window below it.  Anything below the window
-        # floor is implicitly "seen" (rejected).
+        self._ctr = 0
         self._max_nonce = -1
-        self._nonce_window = set()  # nonces in [_max_nonce - _NONCE_WINDOW + 1, _max_nonce]
-        self._NONCE_WINDOW = 65536  # must be >= WINDOW_SIZE * MAX_RETRIES to tolerate reordering
-
-    # -- internal ----------------------------------------------------------
+        self._nonce_window = set()
+        self._NONCE_WINDOW = 65536
 
     @staticmethod
     def _keystream(key, nonce, length):
-        """Generate `length` bytes of keystream from SHA-256(key||nonce||ctr)."""
         out = bytearray()
         blk = 0
         while len(out) < length:
-            out += hashlib.sha256(
-                key + nonce + struct.pack(">Q", blk)
-            ).digest()
+            out += hashlib.sha256(key + nonce + struct.pack(">Q", blk)).digest()
             blk += 1
         return bytes(out[:length])
 
@@ -228,45 +282,36 @@ class Cipher:
     def _xor(a, b):
         return bytes(x ^ y for x, y in zip(a, b))
 
-    # -- public API --------------------------------------------------------
-
     def encrypt(self, ptype: int, plaintext: bytes) -> bytes:
-        """Encrypt & authenticate.  Returns wire-ready packet bytes."""
         nonce = struct.pack(">Q", self._ctr)
         self._ctr += 1
-        ct = self._xor(plaintext, self._keystream(self._ek, nonce, len(plaintext)))
-        header = struct.pack("B", ptype) + nonce  # 9 bytes
-        mac = _hmac.new(self._mk, header + ct, hashlib.sha256).digest()[:16]
+        ct     = self._xor(plaintext, self._keystream(self._ek, nonce, len(plaintext)))
+        header = struct.pack("B", ptype) + nonce
+        mac    = _hmac.new(self._mk, header + ct, hashlib.sha256).digest()[:16]
         return header + ct + mac
 
     def decrypt(self, raw: bytes):
-        """Decrypt & verify.  Returns (ptype, plaintext) or (None, None)."""
-        if len(raw) < 9 + 16:  # header + mac minimum
+        if len(raw) < 9 + 16:
             return None, None
-        ptype = raw[0]
-        nonce = raw[1:9]
-        ct = raw[9:-16]
-        mac = raw[-16:]
+        ptype  = raw[0]
+        nonce  = raw[1:9]
+        ct     = raw[9:-16]
+        mac    = raw[-16:]
         header = raw[:9]
         expected = _hmac.new(self._dmk, header + ct, hashlib.sha256).digest()[:16]
         if not _hmac.compare_digest(mac, expected):
             return None, None
-        # Replay protection -- sliding window over nonce counter values
-        nonce_val = struct.unpack(">Q", nonce)[0]
+        nonce_val    = struct.unpack(">Q", nonce)[0]
         window_floor = max(self._max_nonce - self._NONCE_WINDOW + 1, 0)
         if nonce_val < window_floor:
-            return None, None  # too old -- implicitly rejected
+            return None, None
         if nonce_val in self._nonce_window:
-            return None, None  # already seen within window
-        # Accept -- update window
+            return None, None
         self._nonce_window.add(nonce_val)
         if nonce_val > self._max_nonce:
             self._max_nonce = nonce_val
-            # Prune entries that fell below the new window floor
             new_floor = max(self._max_nonce - self._NONCE_WINDOW + 1, 0)
-            self._nonce_window = {
-                n for n in self._nonce_window if n >= new_floor
-            }
+            self._nonce_window = {n for n in self._nonce_window if n >= new_floor}
         pt = self._xor(ct, self._keystream(self._dk, nonce, len(ct)))
         return ptype, pt
 
@@ -275,7 +320,6 @@ class Cipher:
 # Diffie-Hellman Forward Secrecy  (RFC 3526 Group 14, 2048-bit MODP)
 # ===============================================================================
 
-# RFC 3526 Group 14 -- well-known 2048-bit safe prime
 _DH_P = int(
     "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1"
     "29024E088A67CC74020BBEA63B139B22514A08798E3404DD"
@@ -295,16 +339,13 @@ _DH_KEY_BYTES = 256  # 2048 bits
 
 
 def _dh_keypair():
-    """Generate an ephemeral DH keypair.  Returns (private_int, public_bytes)."""
-    private = int.from_bytes(secrets.token_bytes(32), "big")  # 256-bit exponent
-    public = pow(_DH_G, private, _DH_P)
+    private = int.from_bytes(secrets.token_bytes(32), "big")
+    public  = pow(_DH_G, private, _DH_P)
     return private, public.to_bytes(_DH_KEY_BYTES, "big")
 
 
 def _dh_shared_secret(private_int, peer_pub_bytes):
-    """Compute DH shared secret -> 32 bytes (SHA-256 of raw shared value)."""
     peer_pub = int.from_bytes(peer_pub_bytes, "big")
-    # Reject degenerate public keys (must be in [2, p-2])
     if peer_pub < 2 or peer_pub >= _DH_P - 1:
         raise ValueError("Invalid DH public key")
     raw_shared = pow(peer_pub, private_int, _DH_P)
@@ -313,17 +354,6 @@ def _dh_shared_secret(private_int, peer_pub_bytes):
 
 # ===============================================================================
 # Code Encoding  (out-of-band strings the users copy-paste)
-#
-# Human-memorable word codes using a subset of the BIP39 English wordlist
-# (1024 words, 10 bits per word).  All data is binary-packed then encoded
-# as words.
-#
-#   SEND code : secret(16) + salt(16) + pub_ip(4) + pub_port(2)
-#               + local_ip(4) + local_port(2) = 44 bytes = 352 bits
-#               -> ceil(352/10) = 36 words
-#
-#   RECV code : pub_ip(4) + pub_port(2) + local_ip(4) + local_port(2)
-#               + hmac(16) = 28 bytes = 224 bits -> ceil(224/10) = 23 words
 # ===============================================================================
 
 # fmt: off
@@ -569,20 +599,18 @@ _WORDLIST = [
 ]
 # fmt: on
 
-_WORDLIST = _WORDLIST[:1024]   # 1024 words -> 10 bits per word
-_WORD_INDEX = {w: i for i, w in enumerate(_WORDLIST)}
-
-_BITS_PER_WORD = 10  # log2(1024)
+_WORDLIST    = _WORDLIST[:1024]
+_WORD_INDEX  = {w: i for i, w in enumerate(_WORDLIST)}
+_BITS_PER_WORD = 10
 
 
 def _bytes_to_words(data: bytes) -> str:
-    """Encode bytes as a space-separated sequence of common English words."""
-    bits = len(data) * 8
+    bits    = len(data) * 8
     n_words = math.ceil(bits / _BITS_PER_WORD)
-    n = int.from_bytes(data, "big")
-    n <<= (n_words * _BITS_PER_WORD - bits)
-    words = []
-    mask = (1 << _BITS_PER_WORD) - 1
+    n       = int.from_bytes(data, "big")
+    n     <<= (n_words * _BITS_PER_WORD - bits)
+    words   = []
+    mask    = (1 << _BITS_PER_WORD) - 1
     for _ in range(n_words):
         words.append(_WORDLIST[n & mask])
         n >>= _BITS_PER_WORD
@@ -590,8 +618,7 @@ def _bytes_to_words(data: bytes) -> str:
 
 
 def _words_to_bytes(phrase: str, expected_bytes: int) -> bytes:
-    """Decode a word phrase back to bytes."""
-    words = phrase.strip().lower().split()
+    words   = phrase.strip().lower().split()
     n_words = math.ceil(expected_bytes * 8 / _BITS_PER_WORD)
     if len(words) != n_words:
         raise ValueError(f"Expected {n_words} words, got {len(words)}")
@@ -605,7 +632,6 @@ def _words_to_bytes(phrase: str, expected_bytes: int) -> bytes:
 
 
 def encode_sender_code(secret, salt, pub_ip, pub_port, local_ip, local_port):
-    # 16 + 16 + 4 + 2 + 4 + 2 = 44 bytes -> 36 words
     data = (
         secret
         + salt
@@ -618,18 +644,17 @@ def encode_sender_code(secret, salt, pub_ip, pub_port, local_ip, local_port):
 
 
 def decode_sender_code(code):
-    data = _words_to_bytes(code, 44)
-    secret = data[:16]
-    salt = data[16:32]
-    pub_ip = socket.inet_ntoa(data[32:36])
-    pub_port = struct.unpack("!H", data[36:38])[0]
-    local_ip = socket.inet_ntoa(data[38:42])
+    data       = _words_to_bytes(code, 44)
+    secret     = data[:16]
+    salt       = data[16:32]
+    pub_ip     = socket.inet_ntoa(data[32:36])
+    pub_port   = struct.unpack("!H", data[36:38])[0]
+    local_ip   = socket.inet_ntoa(data[38:42])
     local_port = struct.unpack("!H", data[42:44])[0]
     return secret, salt, pub_ip, pub_port, local_ip, local_port
 
 
 def encode_recv_code(pub_ip, pub_port, local_ip, local_port, secret):
-    # 4 + 2 + 4 + 2 = 12 bytes of address data
     raw = (
         socket.inet_aton(pub_ip)
         + struct.pack("!H", pub_port)
@@ -637,19 +662,18 @@ def encode_recv_code(pub_ip, pub_port, local_ip, local_port, secret):
         + struct.pack("!H", local_port)
     )
     tag = _hmac.new(secret, raw, hashlib.sha256).digest()[:16]
-    # 12 + 16 = 28 bytes -> 23 words
     return _bytes_to_words(raw + tag)
 
 
 def decode_recv_code(code, secret):
-    data = _words_to_bytes(code, 28)
+    data     = _words_to_bytes(code, 28)
     raw, tag = data[:12], data[12:28]
     expected = _hmac.new(secret, raw, hashlib.sha256).digest()[:16]
     if not _hmac.compare_digest(tag, expected):
         return None
-    pub_ip = socket.inet_ntoa(raw[0:4])
-    pub_port = struct.unpack("!H", raw[4:6])[0]
-    local_ip = socket.inet_ntoa(raw[6:10])
+    pub_ip     = socket.inet_ntoa(raw[0:4])
+    pub_port   = struct.unpack("!H", raw[4:6])[0]
+    local_ip   = socket.inet_ntoa(raw[6:10])
     local_port = struct.unpack("!H", raw[10:12])[0]
     return pub_ip, pub_port, local_ip, local_port
 
@@ -665,15 +689,34 @@ def punch_hole(sock, cipher, pub_addr, local_addr, dh_pub_bytes,
     Simultaneously send encrypted HELLOs (carrying our DH public key) to
     the peer's public and local endpoints until one replies with theirs.
     Returns (peer_addr, peer_dh_pub_bytes) or (None, None).
+
+    Robustness measures
+    -------------------
+    1. _drain_socket() is called first to discard any packets already in
+       the OS buffer.  This prevents stale HELLOs from a cancelled earlier
+       receiver session from being mistaken for a live peer reply.
+
+    2. Every received packet is checked against the expected peer addresses
+       (targets) before being decrypted and processed.  This means a stale
+       HELLO that somehow survived the drain (e.g. arrived in the tiny
+       window between drain and the first select) is silently discarded
+       rather than causing a connection to a dead port.
+
+    3. All socket operations are wrapped in try/except OSError so that
+       transient network errors (including Windows ICMP port-unreachable
+       feedback, WinError 10054) never propagate as uncaught exceptions.
     """
     targets = set()
     targets.add(pub_addr)
     if local_addr and local_addr != pub_addr:
         targets.add(local_addr)
 
-    hello_payload = b"DH1:" + dh_pub_bytes  # 4 + 256 = 260 bytes
-    hello_pkt = cipher.encrypt(T_HELLO, hello_payload)
-    start = time.time()
+    # Flush stale packets before we start listening.
+    _drain_socket(sock)
+
+    hello_payload = b"DH1:" + dh_pub_bytes
+    hello_pkt     = cipher.encrypt(T_HELLO, hello_payload)
+    start         = time.time()
 
     sys.stdout.write("  Punching through NAT...")
     sys.stdout.flush()
@@ -690,27 +733,43 @@ def punch_hole(sock, cipher, pub_addr, local_addr, dh_pub_bytes,
         deadline = time.time() + PUNCH_INTERVAL
         while time.time() < deadline:
             wait = max(deadline - time.time(), 0)
-            ready = select.select([sock], [], [], min(wait, 0.05))
+            try:
+                ready = select.select([sock], [], [], min(wait, 0.05))
+            except OSError:
+                continue
             if not ready[0]:
                 continue
             try:
                 data, addr = sock.recvfrom(RECV_BUF)
-                ptype, payload = cipher.decrypt(data)
-                if ptype == T_HELLO and payload and payload[:4] == b"DH1:":
-                    peer_dh_pub = payload[4:]
-                    if len(peer_dh_pub) != _DH_KEY_BYTES:
-                        continue  # malformed -- ignore
-                    # Confirm the path with a few extra HELLOs
-                    for _ in range(5):
-                        try:
-                            sock.sendto(hello_pkt, addr)
-                        except OSError:
-                            pass
-                        time.sleep(0.05)
-                    print(f"\n  Connected to {addr[0]}:{addr[1]}")
-                    return addr, peer_dh_pub
             except OSError:
-                pass
+                continue
+
+            # ---- addr filter (the core bug-fix) --------------------------------
+            # Only accept HELLOs from the address embedded in the recv/send code.
+            # Packets from any other source are silently dropped.  This stops a
+            # stale HELLO from a previously cancelled receiver from being
+            # accepted as the "connection", which would make the sender target
+            # a now-closed port and crash with WinError 10054 on the next recv.
+            if addr not in targets:
+                continue
+            # --------------------------------------------------------------------
+
+            ptype, payload = cipher.decrypt(data)
+            if ptype == T_HELLO and payload and payload[:4] == b"DH1:":
+                peer_dh_pub = payload[4:]
+                if len(peer_dh_pub) != _DH_KEY_BYTES:
+                    continue   # malformed -- ignore
+                # Confirm the path with a few extra HELLOs
+                for _ in range(5):
+                    try:
+                        sock.sendto(hello_pkt, addr)
+                    except OSError:
+                        pass
+                    time.sleep(0.05)
+                print(f"\n  Connected to {addr[0]}:{addr[1]}")
+                return addr, peer_dh_pub
+            # Any other packet type here (e.g. T_META from a racing sender)
+            # is silently ignored; punch_hole only cares about HELLOs.
 
         elapsed = int(time.time() - start)
         if elapsed >= 60:
@@ -729,71 +788,129 @@ def punch_hole(sock, cipher, pub_addr, local_addr, dh_pub_bytes,
 
 
 def _send_data_pkt(sock, peer, cipher, seq, chunk):
+    """Send one data chunk.  Silently absorbs transient OS errors;
+    the retransmit logic will resend any unACKed packet automatically."""
     payload = struct.pack(">I", seq) + chunk
-    sock.sendto(cipher.encrypt(T_DATA, payload), peer)
+    try:
+        sock.sendto(cipher.encrypt(T_DATA, payload), peer)
+    except OSError:
+        pass   # retransmit will cover it
 
 
 def send_file_reliable(sock, peer, cipher, filepath, filesize, filehash,
                        connect_timeout=CONNECT_TIMEOUT):
-    """Read file in chunks and send with windowed retransmission."""
+    """
+    Read the file in chunks and deliver it with windowed retransmission.
+
+    Returns True on success, False on any recoverable failure.
+    Raises nothing -- all errors are caught and turned into a False return
+    with an explanatory message printed to stdout.
+    """
     total_chunks = math.ceil(filesize / CHUNK_SIZE) if filesize > 0 else 0
 
-    # -- send META until ACKed (time-based deadline, not a loop count) --
+    # ---- Send META until the receiver ACKs or declines ----------------------
     meta = json.dumps(
         {"name": os.path.basename(filepath), "size": filesize, "hash": filehash}
     ).encode()
-    meta_acked = False
-    meta_start = time.time()
+    meta_acked   = False
+    meta_declined = False
+    meta_start   = time.time()
     meta_deadline = meta_start + connect_timeout
-    last_print = 0.0
+    last_print   = 0.0
+
     while time.time() < meta_deadline:
-        sock.sendto(cipher.encrypt(T_META, meta), peer)
-        ready = select.select([sock], [], [], 0.5)
+        try:
+            sock.sendto(cipher.encrypt(T_META, meta), peer)
+        except OSError:
+            pass
+
+        try:
+            ready = select.select([sock], [], [], 0.5)
+        except OSError:
+            continue
+
         if ready[0]:
-            raw, _ = sock.recvfrom(RECV_BUF)
+            try:
+                raw, _ = sock.recvfrom(RECV_BUF)
+            except OSError:
+                # On Windows, sending to a closed local port generates an
+                # ICMP port-unreachable that surfaces as WinError 10054 on
+                # the next recvfrom.  Swallow it and keep retrying META.
+                continue
             ptype, pl = cipher.decrypt(raw)
             if ptype == T_ACK:
                 meta_acked = True
                 break
+            if ptype == T_ABORT:
+                meta_declined = True
+                break
+
         elapsed = time.time() - meta_start
         if elapsed - last_print >= 30:
             last_print = elapsed
-            sys.stdout.write(
-                f"\r  Waiting for receiver... {int(elapsed)}s  "
-            )
+            sys.stdout.write(f"\r  Waiting for receiver... {int(elapsed)}s  ")
             sys.stdout.flush()
+
+    if meta_declined:
+        print("\n  Receiver declined the transfer.")
+        return False
     if not meta_acked:
-        print("\n  Failed to deliver file metadata -- receiver never responded.")
+        print("\n  Receiver did not respond to file info -- timed out.")
         return False
 
     if total_chunks == 0:
-        # empty file -- just send DONE
+        # Empty file -- just signal DONE
         for _ in range(10):
-            sock.sendto(cipher.encrypt(T_DONE, b"DONE"), peer)
+            try:
+                sock.sendto(cipher.encrypt(T_DONE, b"DONE"), peer)
+            except OSError:
+                pass
             time.sleep(0.05)
         return True
 
     print(f"  Sending {total_chunks} chunks ({_fmt(filesize)})")
 
-    # -- chunked send --
-    fh = open(filepath, "rb")
+    # ---- Chunked send with sliding-window ARQ --------------------------------
+    try:
+        fh = open(filepath, "rb")
+    except OSError as e:
+        print(f"\n  Cannot open file for reading: {e}")
+        return False
+
     chunk_cache = {}
-    acked = set()
-    sent_time = {}
-    retries = {}
-    next_seq = 0
+    acked       = set()
+    sent_time   = {}
+    retries     = {}
+    next_seq    = 0
 
     def _get_chunk(seq):
         if seq not in chunk_cache:
-            fh.seek(seq * CHUNK_SIZE)
-            chunk_cache[seq] = fh.read(CHUNK_SIZE)
+            try:
+                fh.seek(seq * CHUNK_SIZE)
+                chunk_cache[seq] = fh.read(CHUNK_SIZE)
+            except OSError as e:
+                raise OSError(f"Error reading source file: {e}") from e
         return chunk_cache[seq]
+
+    last_acked_count  = 0
+    last_progress_t   = time.time()
 
     try:
         while len(acked) < total_chunks:
             now = time.time()
 
-            # Fill the send window
+            # ---- Stall detection --------------------------------------------
+            # If the acked count hasn't moved in STALL_TIMEOUT seconds the
+            # receiver has gone away without sending T_ABORT.
+            if len(acked) > last_acked_count:
+                last_acked_count = len(acked)
+                last_progress_t  = now
+            elif now - last_progress_t > STALL_TIMEOUT:
+                print(f"\n  Transfer stalled -- no progress for {STALL_TIMEOUT}s. "
+                      f"Receiver may have disconnected.")
+                return False
+
+            # ---- Fill the send window ---------------------------------------
             while (
                 next_seq < total_chunks
                 and (next_seq - len(acked)) < WINDOW_SIZE
@@ -803,21 +920,26 @@ def send_file_reliable(sock, peer, cipher, filepath, filesize, filehash,
                 retries.setdefault(next_seq, 0)
                 next_seq += 1
 
-            # Retransmit timed-out packets
+            # ---- Retransmit timed-out packets --------------------------------
             for seq in list(sent_time):
                 if seq in acked:
                     continue
                 if now - sent_time[seq] > ACK_TIMEOUT:
                     retries[seq] += 1
                     if retries[seq] > MAX_RETRIES:
-                        print(f"\n  ERROR: chunk {seq} exceeded {MAX_RETRIES} retries")
+                        print(f"\n  Chunk {seq} hit the retry limit "
+                              f"({MAX_RETRIES} attempts). "
+                              f"Network may be too lossy or receiver disconnected.")
                         return False
                     _send_data_pkt(sock, peer, cipher, seq, _get_chunk(seq))
                     sent_time[seq] = now
 
-            # Drain ACKs
+            # ---- Drain incoming ACKs ----------------------------------------
             while True:
-                ready = select.select([sock], [], [], 0.01)
+                try:
+                    ready = select.select([sock], [], [], 0.01)
+                except OSError:
+                    break
                 if not ready[0]:
                     break
                 try:
@@ -827,52 +949,80 @@ def send_file_reliable(sock, peer, cipher, filepath, filesize, filehash,
                         ack_seq = struct.unpack(">I", pl[:4])[0]
                         if ack_seq != 0xFFFFFFFF:
                             acked.add(ack_seq)
-                            # Free cache for acked chunks to save memory
                             chunk_cache.pop(ack_seq, None)
+                    elif ptype == T_ABORT:
+                        print("\n  Receiver cancelled the transfer.")
+                        return False
                 except OSError:
                     pass
 
-            # Progress
-            pct = len(acked) * 100 // total_chunks
+            # ---- Progress display -------------------------------------------
+            pct        = len(acked) * 100 // total_chunks
             done_bytes = min(len(acked) * CHUNK_SIZE, filesize)
             sys.stdout.write(
                 f"\r  Progress: {pct:3d}%  ({_fmt(done_bytes)} / {_fmt(filesize)})"
             )
             sys.stdout.flush()
 
+    except KeyboardInterrupt:
+        print("\n  Cancelled.")
+        _send_abort_signal(sock, cipher, peer, "CANCEL")
+        return False
+    except OSError as e:
+        print(f"\n  I/O error during transfer: {e}")
+        return False
     finally:
         fh.close()
 
-    # -- send DONE (time-based deadline) --
-    done_pkt = cipher.encrypt(T_DONE, b"DONE")
+    # ---- Signal completion --------------------------------------------------
+    done_pkt      = cipher.encrypt(T_DONE, b"DONE")
     done_deadline = time.time() + DONE_TIMEOUT
     while time.time() < done_deadline:
-        sock.sendto(done_pkt, peer)
-        ready = select.select([sock], [], [], 0.5)
+        try:
+            sock.sendto(done_pkt, peer)
+        except OSError:
+            pass
+        try:
+            ready = select.select([sock], [], [], 0.5)
+        except OSError:
+            continue
         if ready[0]:
-            raw, _ = sock.recvfrom(RECV_BUF)
+            try:
+                raw, _ = sock.recvfrom(RECV_BUF)
+            except OSError:
+                continue
             ptype, _ = cipher.decrypt(raw)
             if ptype == T_DONEACK:
                 break
+            if ptype == T_ABORT:
+                print("\n  Receiver cancelled the transfer.")
+                return False
 
     print(f"\r  Progress: 100%  ({_fmt(filesize)} / {_fmt(filesize)})")
     return True
 
 
 def recv_file_reliable(sock, peer, cipher, connect_timeout=CONNECT_TIMEOUT):
-    """Receive a file, streaming chunks to a temp file.
-    Returns (filename, temp_path, expected_hash) or None."""
+    """
+    Receive a file, streaming chunks to a temp file.
+    Returns (filename, temp_path, expected_hash) or None on any failure.
 
-    # -- wait for META (time-based deadline) --
-    print("  Waiting for file info (sender may still be setting up)...")
-    meta = None
-    t0 = time.time()
-    deadline = t0 + connect_timeout
+    Raises nothing.  Every error path cleans up the temp file and prints
+    a user-friendly explanation.
+    """
+
+    # ---- Wait for META and let the user approve or decline ------------------
+    print("  Waiting for file info (you will approve before transfer starts)...")
+    accepted   = None
+    t0         = time.time()
+    deadline   = t0 + connect_timeout
     last_print = 0.0
-    while meta is None:
+
+    while accepted is None:
         if time.time() > deadline:
-            print("\n  Timed out waiting for metadata.")
+            print("\n  Timed out waiting for sender to send file info.")
             return None
+
         elapsed = time.time() - t0
         if elapsed - last_print >= 30:
             last_print = elapsed
@@ -880,99 +1030,159 @@ def recv_file_reliable(sock, peer, cipher, connect_timeout=CONNECT_TIMEOUT):
             label = f"{mins}m {secs}s" if mins else f"{secs}s"
             sys.stdout.write(f"\r  Still waiting for sender... {label}  ")
             sys.stdout.flush()
-        ready = select.select([sock], [], [], 2.0)
+
+        try:
+            ready = select.select([sock], [], [], 2.0)
+        except OSError:
+            continue
         if not ready[0]:
             continue
-        raw, addr = sock.recvfrom(RECV_BUF)
+
+        try:
+            raw, addr = sock.recvfrom(RECV_BUF)
+        except OSError:
+            continue
+
         ptype, payload = cipher.decrypt(raw)
         if ptype == T_HELLO:
-            # Late punch reply -- respond and keep waiting
-            # (DH key already exchanged; just echo back)
-            pass
+            pass   # late punch reply -- ignore (DH already done)
         elif ptype == T_META and payload:
-            meta = json.loads(payload)
-            sock.sendto(
-                cipher.encrypt(T_ACK, struct.pack(">I", 0xFFFFFFFF)), addr
-            )
-            peer = addr
+            try:
+                meta = json.loads(payload)
+            except Exception:
+                continue
 
-    # -- validate metadata types --
-    if not isinstance(meta, dict):
-        print("  Error: malformed metadata (not a JSON object).")
-        return None
-    if not isinstance(meta.get("name"), str) or not meta["name"]:
-        print("  Error: missing or invalid 'name' in metadata.")
-        return None
-    if not isinstance(meta.get("size"), int) or meta["size"] < 0:
-        print("  Error: missing or invalid 'size' in metadata.")
-        return None
-    if not isinstance(meta.get("hash"), str) or len(meta["hash"]) != 64:
-        print("  Error: missing or invalid 'hash' in metadata.")
-        return None
+            if not isinstance(meta, dict):
+                continue
+            if not isinstance(meta.get("name"), str) or not meta["name"]:
+                continue
+            if not isinstance(meta.get("size"), int) or meta["size"] < 0:
+                continue
+            if not isinstance(meta.get("hash"), str) or len(meta["hash"]) != 64:
+                continue
 
-    # -- sanitise filename (#1 -- path traversal) --
-    raw_name = meta["name"]
-    filename = os.path.basename(raw_name)
-    if not filename or filename.startswith("."):
-        print(f"  Error: invalid filename received: {raw_name!r}")
-        return None
+            raw_name = meta["name"]
+            filename = os.path.basename(raw_name)
+            if not filename or filename.startswith("."):
+                print(f"\n  Sender provided an invalid filename: {raw_name!r}")
+                return None
 
-    filesize = meta["size"]
-    filehash = meta["hash"]
+            filesize = meta["size"]
+            filehash = meta["hash"]
 
-    # -- enforce file size limit (#8) --
-    if filesize > MAX_FILE_SIZE:
-        print(f"  Error: file too large ({_fmt(filesize)}). "
-              f"Limit is {_fmt(MAX_FILE_SIZE)}.")
-        return None
+            if filesize > MAX_FILE_SIZE:
+                print(f"\n  File too large ({_fmt(filesize)}). "
+                      f"Limit is {_fmt(MAX_FILE_SIZE)}.")
+                _send_abort_signal(sock, cipher, addr, "SIZE")
+                return None
 
+            print(f"\n  Incoming file : {filename}  ({_fmt(filesize)})")
+            try:
+                answer = input("  Accept this file? [y/N]: ").strip().lower()
+            except (KeyboardInterrupt, EOFError):
+                _send_abort_signal(sock, cipher, addr, "CANCEL")
+                print("\n  Cancelled.")
+                return None
+
+            if answer not in ("y", "yes"):
+                _send_abort_signal(sock, cipher, addr, "NO")
+                print("  Transfer declined.")
+                return None
+
+            try:
+                sock.sendto(cipher.encrypt(T_ACK, struct.pack(">I", 0xFFFFFFFF)), addr)
+            except OSError:
+                pass
+            peer     = addr
+            accepted = (filename, filesize, filehash)
+
+    filename, filesize, filehash = accepted
     total_chunks = math.ceil(filesize / CHUNK_SIZE) if filesize > 0 else 0
 
     print(f"  Receiving: {filename}  ({_fmt(filesize)})")
 
     if total_chunks == 0:
-        # Empty file -- create empty temp file
-        tmp = tempfile.NamedTemporaryFile(delete=False, dir=".")
-        tmp.close()
+        try:
+            tmp = tempfile.NamedTemporaryFile(delete=False, dir=".")
+            tmp.close()
+        except OSError as e:
+            print(f"\n  Cannot create temp file: {e}")
+            return None
         return filename, tmp.name, filehash
 
-    # -- receive DATA -- stream to temp file (#7) --
-    tmp = tempfile.NamedTemporaryFile(delete=False, dir=".")
+    # ---- Receive DATA chunks, stream to temp file ---------------------------
+    try:
+        tmp = tempfile.NamedTemporaryFile(delete=False, dir=".")
+    except OSError as e:
+        print(f"\n  Cannot create temp file: {e}")
+        return None
+
     received_seqs = set()
-    done = False
+    done          = False
+    last_recv_t   = time.time()
 
     try:
         while len(received_seqs) < total_chunks or not done:
-            ready = select.select([sock], [], [], 3.0)
+            # ---- Stall detection --------------------------------------------
+            if time.time() - last_recv_t > STALL_TIMEOUT:
+                print(f"\n  Transfer stalled -- no data received for "
+                      f"{STALL_TIMEOUT}s. Sender may have disconnected.")
+                _send_abort_signal(sock, cipher, peer, "STALL")
+                tmp.close()
+                try:
+                    os.unlink(tmp.name)
+                except OSError:
+                    pass
+                return None
+
+            try:
+                ready = select.select([sock], [], [], 2.0)
+            except OSError:
+                continue
             if not ready[0]:
                 if len(received_seqs) >= total_chunks:
-                    break  # probably missed DONE, we have everything
+                    break   # have everything, must have missed DONE
                 continue
+
             try:
                 raw, addr = sock.recvfrom(RECV_BUF)
             except OSError:
                 continue
 
+            # Reset stall timer on any successful receive from our peer
+            if addr == peer:
+                last_recv_t = time.time()
+
             ptype, payload = cipher.decrypt(raw)
             if ptype is None:
                 continue
-
-            # Only accept packets from the established peer
             if addr != peer:
                 continue
 
             if ptype == T_DATA and payload and len(payload) > 4:
                 seq = struct.unpack(">I", payload[:4])[0]
                 if seq >= total_chunks:
-                    continue  # out-of-range seq -- ignore
+                    continue
                 if seq not in received_seqs:
                     chunk = payload[4:]
-                    # Write chunk at correct offset in temp file
-                    tmp.seek(seq * CHUNK_SIZE)
-                    tmp.write(chunk)
+                    try:
+                        tmp.seek(seq * CHUNK_SIZE)
+                        tmp.write(chunk)
+                    except OSError as e:
+                        print(f"\n  Disk write error: {e}")
+                        _send_abort_signal(sock, cipher, peer, "ERROR")
+                        tmp.close()
+                        try:
+                            os.unlink(tmp.name)
+                        except OSError:
+                            pass
+                        return None
                     received_seqs.add(seq)
-                # Always ACK (even duplicates)
-                sock.sendto(cipher.encrypt(T_ACK, struct.pack(">I", seq)), addr)
+                # Always ACK (even duplicates) so sender can advance its window
+                try:
+                    sock.sendto(cipher.encrypt(T_ACK, struct.pack(">I", seq)), addr)
+                except OSError:
+                    pass
 
                 pct = len(received_seqs) * 100 // total_chunks
                 got = min(len(received_seqs) * CHUNK_SIZE, filesize)
@@ -982,47 +1192,76 @@ def recv_file_reliable(sock, peer, cipher, connect_timeout=CONNECT_TIMEOUT):
                 sys.stdout.flush()
 
             elif ptype == T_DONE:
-                sock.sendto(cipher.encrypt(T_DONEACK, b"OK"), addr)
+                try:
+                    sock.sendto(cipher.encrypt(T_DONEACK, b"OK"), addr)
+                except OSError:
+                    pass
                 done = True
                 if len(received_seqs) >= total_chunks:
                     break
 
             elif ptype == T_META:
-                # Re-ACK in case sender didn't get our first ACK
-                sock.sendto(
-                    cipher.encrypt(T_ACK, struct.pack(">I", 0xFFFFFFFF)), addr
-                )
+                # Re-ACK in case sender missed our first META-ACK
+                try:
+                    sock.sendto(
+                        cipher.encrypt(T_ACK, struct.pack(">I", 0xFFFFFFFF)), addr
+                    )
+                except OSError:
+                    pass
 
-        # Truncate to exact file size (last chunk may be short)
-        tmp.truncate(filesize)
-        tmp.close()
+        # ---- Finalize the temp file -----------------------------------------
+        try:
+            tmp.truncate(filesize)
+            tmp.close()
+        except OSError as e:
+            print(f"\n  Disk error finalising file: {e}")
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
+            return None
 
-    except Exception:
+    except KeyboardInterrupt:
+        _send_abort_signal(sock, cipher, peer, "CANCEL")
         tmp.close()
-        os.unlink(tmp.name)
-        raise
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+        print("\n  Cancelled by receiver.")
+        return None
 
     print(f"\r  Progress: 100%  ({_fmt(filesize)} / {_fmt(filesize)})")
 
-    # -- verify hash --
+    # ---- Verify end-to-end hash ---------------------------------------------
     sha = hashlib.sha256()
-    with open(tmp.name, "rb") as f:
-        while True:
-            blk = f.read(1 << 20)
-            if not blk:
-                break
-            sha.update(blk)
-    actual = sha.hexdigest()
+    try:
+        with open(tmp.name, "rb") as f:
+            while True:
+                blk = f.read(1 << 20)
+                if not blk:
+                    break
+                sha.update(blk)
+    except OSError as e:
+        print(f"\n  Cannot read temp file for verification: {e}")
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+        return None
 
+    actual = sha.hexdigest()
     if actual != filehash:
         print("  ERROR: SHA-256 mismatch -- file is corrupted or tampered!")
         print(f"    expected {filehash}")
         print(f"    got      {actual}")
-        os.unlink(tmp.name)
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
         return None
-    else:
-        print("  Integrity verified (SHA-256).")
 
+    print("  Integrity verified (SHA-256).")
     return filename, tmp.name, filehash
 
 
@@ -1032,7 +1271,6 @@ def recv_file_reliable(sock, peer, cipher, connect_timeout=CONNECT_TIMEOUT):
 
 
 def _fmt(n):
-    """Human-readable byte size."""
     for u in ("B", "KB", "MB", "GB"):
         if n < 1024:
             return f"{n:.1f} {u}" if u != "B" else f"{n} B"
@@ -1053,33 +1291,48 @@ BANNER = r"""
 
 
 def cmd_send(filepath, connect_timeout=CONNECT_TIMEOUT):
+    # ---- Pre-flight checks --------------------------------------------------
     if not os.path.isfile(filepath):
-        print(f"  Error: '{filepath}' not found.")
+        print(f"  Error: '{filepath}' not found or is not a file.")
         sys.exit(1)
 
     filename = os.path.basename(filepath)
-    filesize = os.path.getsize(filepath)
+    try:
+        filesize = os.path.getsize(filepath)
+    except OSError as e:
+        print(f"  Error: cannot stat file: {e}")
+        sys.exit(1)
 
     print(f"  File : {filename}")
     print(f"  Size : {_fmt(filesize)}")
 
-    # Hash the file
+    # ---- Hash the file before binding the socket ----------------------------
+    print("  Hashing file...")
     sha = hashlib.sha256()
-    with open(filepath, "rb") as f:
-        while True:
-            blk = f.read(1 << 20)
-            if not blk:
-                break
-            sha.update(blk)
+    try:
+        with open(filepath, "rb") as f:
+            while True:
+                blk = f.read(1 << 20)
+                if not blk:
+                    break
+                sha.update(blk)
+    except OSError as e:
+        print(f"  Error: cannot read file: {e}")
+        sys.exit(1)
     filehash = sha.hexdigest()
 
-    # Bind UDP socket
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind(("", 0))
-    local_port = sock.getsockname()[1]
-    local_ip = get_local_ip()
+    # ---- Bind UDP socket ----------------------------------------------------
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(("", 0))
+    except OSError as e:
+        print(f"  Error: cannot create UDP socket: {e}")
+        sys.exit(1)
 
-    # STUN discovery
+    local_port = sock.getsockname()[1]
+    local_ip   = get_local_ip()
+
+    # ---- STUN ---------------------------------------------------------------
     print("  Discovering public endpoint via STUN...")
     pub = stun_discover(sock)
     if pub:
@@ -1087,13 +1340,13 @@ def cmd_send(filepath, connect_timeout=CONNECT_TIMEOUT):
         print(f"  Public : {pub_ip}:{pub_port}")
     else:
         pub_ip, pub_port = local_ip, local_port
-        print(f"  STUN failed -- falling back to local address.")
+        print("  STUN failed -- using local address (LAN-only transfer).")
     print(f"  Local  : {local_ip}:{local_port}")
 
-    # Generate secret, salt & code
+    # ---- Generate secret, salt & SEND CODE ----------------------------------
     secret = secrets.token_bytes(16)
-    salt = secrets.token_bytes(16)
-    code = encode_sender_code(secret, salt, pub_ip, pub_port, local_ip, local_port)
+    salt   = secrets.token_bytes(16)
+    code   = encode_sender_code(secret, salt, pub_ip, pub_port, local_ip, local_port)
 
     print()
     print("  +==========================================================+")
@@ -1103,7 +1356,7 @@ def cmd_send(filepath, connect_timeout=CONNECT_TIMEOUT):
     print(f"  {code}")
     print()
 
-    # Wait for receiver's code
+    # ---- Wait for receiver's code -------------------------------------------
     try:
         rcode = input("  Paste receiver's code: ").strip()
     except (KeyboardInterrupt, EOFError):
@@ -1111,9 +1364,16 @@ def cmd_send(filepath, connect_timeout=CONNECT_TIMEOUT):
         sock.close()
         sys.exit(0)
 
+    if not rcode:
+        print("  No code entered.")
+        sock.close()
+        sys.exit(1)
+
     result = decode_recv_code(rcode, secret)
     if result is None:
-        print("  Error: invalid receiver code (bad secret or garbled).")
+        print("  Error: invalid receiver code.")
+        print("  Make sure you copied the entire RECV CODE from the receiver's screen,")
+        print("  and that the receiver used the SEND CODE you gave them (not an old one).")
         sock.close()
         sys.exit(1)
 
@@ -1121,33 +1381,45 @@ def cmd_send(filepath, connect_timeout=CONNECT_TIMEOUT):
     print(f"  Peer public : {peer_pub_ip}:{peer_pub_port}")
     print(f"  Peer local  : {peer_local_ip}:{peer_local_port}")
 
-    # Handshake cipher (pre-DH, for HELLO encryption only)
+    # ---- Handshake ----------------------------------------------------------
     print("  Deriving handshake keys (PBKDF2, 100k rounds)...")
     handshake_cipher = Cipher(secret, salt, is_sender=True)
+    dh_priv, dh_pub  = _dh_keypair()
 
-    # Generate ephemeral DH keypair
-    dh_priv, dh_pub = _dh_keypair()
+    try:
+        peer, peer_dh_pub = punch_hole(
+            sock,
+            handshake_cipher,
+            (peer_pub_ip, peer_pub_port),
+            (peer_local_ip, peer_local_port),
+            dh_pub,
+            timeout=connect_timeout,
+        )
+    except KeyboardInterrupt:
+        print("\n  Cancelled during connection.")
+        sock.close()
+        sys.exit(0)
 
-    # Hole punch (exchanges DH public keys)
-    peer, peer_dh_pub = punch_hole(
-        sock,
-        handshake_cipher,
-        (peer_pub_ip, peer_pub_port),
-        (peer_local_ip, peer_local_port),
-        dh_pub,
-        timeout=connect_timeout,
-    )
     if not peer:
-        print("  Could not establish a connection. The NAT(s) may be too strict.")
+        print("  Could not reach the receiver.")
+        print("  Possible causes:")
+        print("    - The receiver is not running 'recv' right now")
+        print("    - The recv code is from a different session (try again from the start)")
+        print("    - Both sides are behind symmetric NAT (needs a relay server)")
         sock.close()
         sys.exit(1)
 
-    # Compute DH shared secret and derive session cipher (forward secrecy)
-    dh_shared = _dh_shared_secret(dh_priv, peer_dh_pub)
+    try:
+        dh_shared = _dh_shared_secret(dh_priv, peer_dh_pub)
+    except ValueError as e:
+        print(f"  Handshake error: {e}")
+        sock.close()
+        sys.exit(1)
+
     print("  Forward-secret session keys established (DH + PBKDF2).")
     session_cipher = Cipher(secret + dh_shared, salt, is_sender=True)
 
-    # Transfer
+    # ---- Transfer -----------------------------------------------------------
     ok = send_file_reliable(
         sock, peer, session_cipher, filepath, filesize, filehash,
         connect_timeout=connect_timeout,
@@ -1157,20 +1429,24 @@ def cmd_send(filepath, connect_timeout=CONNECT_TIMEOUT):
     if ok:
         print("  Done -- file sent successfully!")
     else:
-        print("  Transfer failed.")
         sys.exit(1)
 
 
 def cmd_recv(connect_timeout=CONNECT_TIMEOUT):
     save_dir = "."
 
-    # Bind
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind(("", 0))
-    local_port = sock.getsockname()[1]
-    local_ip = get_local_ip()
+    # ---- Bind ---------------------------------------------------------------
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(("", 0))
+    except OSError as e:
+        print(f"  Error: cannot create UDP socket: {e}")
+        sys.exit(1)
 
-    # STUN
+    local_port = sock.getsockname()[1]
+    local_ip   = get_local_ip()
+
+    # ---- STUN ---------------------------------------------------------------
     print("  Discovering public endpoint via STUN...")
     pub = stun_discover(sock)
     if pub:
@@ -1178,10 +1454,10 @@ def cmd_recv(connect_timeout=CONNECT_TIMEOUT):
         print(f"  Public : {pub_ip}:{pub_port}")
     else:
         pub_ip, pub_port = local_ip, local_port
-        print(f"  STUN failed -- falling back to local address.")
+        print("  STUN failed -- using local address (LAN-only transfer).")
     print(f"  Local  : {local_ip}:{local_port}")
 
-    # Get sender code
+    # ---- Get sender code ----------------------------------------------------
     print()
     try:
         scode = input("  Paste sender's code: ").strip()
@@ -1190,21 +1466,26 @@ def cmd_recv(connect_timeout=CONNECT_TIMEOUT):
         sock.close()
         sys.exit(0)
 
+    if not scode:
+        print("  No code entered.")
+        sock.close()
+        sys.exit(1)
+
     try:
         secret, salt, peer_pub_ip, peer_pub_port, peer_local_ip, peer_local_port = (
             decode_sender_code(scode)
         )
     except Exception:
         print("  Error: invalid sender code.")
+        print("  Make sure you copied the entire SEND CODE from the sender's screen.")
         sock.close()
         sys.exit(1)
 
     print(f"  Peer public : {peer_pub_ip}:{peer_pub_port}")
     print(f"  Peer local  : {peer_local_ip}:{peer_local_port}")
 
-    # Display receiver code
+    # ---- Display RECV CODE --------------------------------------------------
     rcode = encode_recv_code(pub_ip, pub_port, local_ip, local_port, secret)
-
     print()
     print("  +==========================================================+")
     print("  |  RECV CODE -- give this back to the sender:              |")
@@ -1213,59 +1494,72 @@ def cmd_recv(connect_timeout=CONNECT_TIMEOUT):
     print(f"  {rcode}")
     print()
 
-    # Handshake cipher (pre-DH, for HELLO encryption only)
+    # ---- Handshake ----------------------------------------------------------
     print("  Deriving handshake keys (PBKDF2, 100k rounds)...")
     handshake_cipher = Cipher(secret, salt, is_sender=False)
+    dh_priv, dh_pub  = _dh_keypair()
 
-    # Generate ephemeral DH keypair
-    dh_priv, dh_pub = _dh_keypair()
-
-    # Synchronisation pause
     try:
-        input("  Press ENTER once the sender has pasted your code... ")
-    except (KeyboardInterrupt, EOFError):
-        print("\n  Cancelled.")
+        peer, peer_dh_pub = punch_hole(
+            sock,
+            handshake_cipher,
+            (peer_pub_ip, peer_pub_port),
+            (peer_local_ip, peer_local_port),
+            dh_pub,
+            timeout=connect_timeout,
+        )
+    except KeyboardInterrupt:
+        print("\n  Cancelled during connection.")
         sock.close()
         sys.exit(0)
 
-    # Hole punch (exchanges DH public keys)
-    peer, peer_dh_pub = punch_hole(
-        sock,
-        handshake_cipher,
-        (peer_pub_ip, peer_pub_port),
-        (peer_local_ip, peer_local_port),
-        dh_pub,
-        timeout=connect_timeout,
-    )
     if not peer:
-        print("  Could not establish a connection. The NAT(s) may be too strict.")
+        print("  Could not reach the sender.")
+        print("  Possible causes:")
+        print("    - The sender has not yet pasted your recv code")
+        print("    - The send code you used is from a different session")
+        print("    - Both sides are behind symmetric NAT (needs a relay server)")
         sock.close()
         sys.exit(1)
 
-    # Compute DH shared secret and derive session cipher (forward secrecy)
-    dh_shared = _dh_shared_secret(dh_priv, peer_dh_pub)
+    try:
+        dh_shared = _dh_shared_secret(dh_priv, peer_dh_pub)
+    except ValueError as e:
+        print(f"  Handshake error: {e}")
+        sock.close()
+        sys.exit(1)
+
     print("  Forward-secret session keys established (DH + PBKDF2).")
     session_cipher = Cipher(secret + dh_shared, salt, is_sender=False)
 
-    # Receive
-    result = recv_file_reliable(sock, peer, session_cipher,
-                                connect_timeout=connect_timeout)
+    # ---- Receive ------------------------------------------------------------
+    result = recv_file_reliable(
+        sock, peer, session_cipher, connect_timeout=connect_timeout
+    )
     sock.close()
 
     if result is None:
-        print("  Transfer failed.")
         sys.exit(1)
 
     filename, temp_path, _ = result
 
-    # Save to current directory -- never overwrite
+    # ---- Save to disk -------------------------------------------------------
     save_path = os.path.join(save_dir, filename)
     if os.path.exists(save_path):
-        os.unlink(temp_path)  # clean up temp file
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
         print(f"  Error: '{save_path}' already exists. Will not overwrite.")
+        print(f"  The received data is in: {temp_path}")
         sys.exit(1)
 
-    shutil.move(temp_path, save_path)
+    try:
+        shutil.move(temp_path, save_path)
+    except OSError as e:
+        print(f"  Error saving file to '{save_path}': {e}")
+        print(f"  The received data is in: {temp_path}")
+        sys.exit(1)
 
     print(f"  Saved: {save_path}")
     print("  Done -- file received successfully!")
@@ -1286,14 +1580,12 @@ def main():
         print()
         print("  --connect-timeout  Seconds to wait during hole-punch and")
         print(f"                     handshake phases (default: {CONNECT_TIMEOUT}).")
-        print("                     Increase if users are slow to exchange codes.")
-        print()
         sys.exit(0)
 
-    # Parse optional --connect-timeout N (works anywhere after the subcommand)
-    args = sys.argv[1:]
+    # Parse optional --connect-timeout N
+    args            = sys.argv[1:]
     connect_timeout = CONNECT_TIMEOUT
-    filtered = []
+    filtered        = []
     i = 0
     while i < len(args):
         if args[i] == "--connect-timeout" and i + 1 < len(args):
@@ -1302,7 +1594,7 @@ def main():
                 if connect_timeout <= 0:
                     raise ValueError
             except ValueError:
-                print(f"  Error: --connect-timeout must be a positive integer.")
+                print("  Error: --connect-timeout must be a positive integer.")
                 sys.exit(1)
             i += 2
         else:
@@ -1316,18 +1608,42 @@ def main():
 
     cmd = args[0].lower()
 
-    if cmd == "send":
-        if len(args) < 2:
-            print("  Usage: python p2p.py send <file>")
+    try:
+        if cmd == "send":
+            if len(args) < 2:
+                print("  Usage: python p2p.py send <file>")
+                sys.exit(1)
+            cmd_send(args[1], connect_timeout=connect_timeout)
+
+        elif cmd in ("recv", "receive"):
+            cmd_recv(connect_timeout=connect_timeout)
+
+        else:
+            print(f"  Unknown command: {cmd!r}")
+            print("  Use 'send' or 'recv'.")
             sys.exit(1)
-        cmd_send(args[1], connect_timeout=connect_timeout)
 
-    elif cmd in ("recv", "receive"):
-        cmd_recv(connect_timeout=connect_timeout)
+    except KeyboardInterrupt:
+        print("\n  Interrupted.")
+        sys.exit(0)
 
-    else:
-        print(f"  Unknown command: {cmd}")
-        print("  Use 'send' or 'recv'.")
+    except SystemExit:
+        raise   # let sys.exit() pass through cleanly
+
+    except Exception as e:
+        # Something truly unexpected slipped past all the specific handlers.
+        # Write the full traceback to a log file so it can be reported,
+        # but show a clean one-liner to the user.
+        log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "p2p_error.log")
+        try:
+            with open(log_path, "w") as lf:
+                traceback.print_exc(file=lf)
+            print(f"\n  Unexpected error: {e}")
+            print(f"  Full details saved to: {log_path}")
+            print("  Please share that file if you report this issue.")
+        except Exception:
+            # Even writing the log failed -- just show the error inline.
+            print(f"\n  Unexpected error: {e}")
         sys.exit(1)
 
 

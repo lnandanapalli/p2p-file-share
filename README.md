@@ -12,7 +12,7 @@ Like Magic Wormhole, but you don't install anything.
 python p2p.py send photo.jpg
 ```
 
-You'll get a send code (36 words). Give it to the receiver over any channel -- text, email, Discord, whatever.
+You'll get a send code (36 words for IPv4, 55 words for IPv6). Give it to the receiver over any channel -- text, email, Discord, whatever.
 
 By default, the app hides technical connection details like IP addresses and STUN/handshake status. Add `--verbose` if you want to see those details:
 
@@ -27,7 +27,16 @@ python p2p.py recv --verbose
 python p2p.py recv
 ```
 
-Paste the sender's code when prompted. You'll get a recv code (23 words) -- give that back to the sender. Once both codes are exchanged, you'll see the filename and file size. Accept or decline the transfer. If accepted, the encrypted transfer begins automatically.
+Paste the sender's code when prompted. You'll get a recv code (23 words for IPv4, 42 words for IPv6) -- give that back to the sender. Once both codes are exchanged, you'll see the filename and file size. Accept or decline the transfer. If accepted, the encrypted transfer begins automatically.
+
+**Use IPv6 (recommended when both sides have it):**
+
+```
+python p2p.py send photo.jpg -6
+python p2p.py recv -6
+```
+
+Both sides must use `-6` together, or neither should. With IPv6, there is no NAT, so hole punching is not needed and symmetric NAT is not a problem. If a transfer drops mid-way and you resume, the printed resume command will automatically include `-6` -- you don't have to remember to add it.
 
 **Resume a dropped transfer:**
 
@@ -42,9 +51,15 @@ Partial file saved: ./tmpabcd1234
 To resume:          python p2p.py recv --resume "./tmpabcd1234"
 ```
 
+If you were using IPv6, the printed command will include `-6` automatically:
+
+```
+To resume:          python p2p.py recv -6 --resume "./tmpabcd1234"
+```
+
 Use the partial/temp file path from that message, not the final filename. The script verifies that the partial file belongs to the same transfer and resumes from the verified byte position.
 
-**Optional timeout control and resume:**
+**Optional timeout control:**
 
 By default, both sides wait up to 1 hour during the code-exchange and hole-punch phases. If your users are slow to exchange codes, you can increase it:
 
@@ -53,7 +68,7 @@ python p2p.py send photo.jpg --connect-timeout 7200
 python p2p.py recv --connect-timeout 7200
 ```
 
-To resume a dropped transfer with a custom timeout, use the `--resume` flag with the preserved partial file:
+To resume a dropped transfer with a custom timeout:
 
 ```
 python p2p.py recv --resume "./tmpabcd1234" --connect-timeout 7200
@@ -65,9 +80,9 @@ The file saves to the current directory.
 
 ## How it works
 
-1. Both sides discover their public IP/port via STUN (Google's public STUN servers).
+1. Both sides discover their public IP/port via STUN (Google's public STUN servers). With IPv6, the local address is the public address, so STUN is used only for confirmation.
 2. Addresses and a shared secret are packed into human-readable word codes (BIP39 subset, 1024 words).
-3. Both sides simultaneously send UDP packets to each other's public and local addresses until one gets through (hole punching).
+3. Both sides simultaneously send UDP packets to each other's public and local addresses until one gets through (hole punching). With IPv6, there is no NAT, so this step completes more reliably.
 4. An ephemeral Diffie-Hellman key exchange happens during the punch for forward secrecy.
 5. The sender's metadata (filename, file size, hash) is sent to the receiver.
 6. The receiver sees the filename and file size, then accepts or declines the transfer.
@@ -79,14 +94,16 @@ If the receiver declines the transfer, both sides are notified and the connectio
 
 ## NAT compatibility
 
-Works behind most consumer NATs:
+Works behind most consumer NATs (IPv4):
 
 - **Full-cone** -- works
 - **Address-restricted** -- works
 - **Port-restricted** -- works
-- **Symmetric** -- will likely fail (both sides behind symmetric NAT is the hard case; no relay server exists to fall back on)
+- **Symmetric** -- will likely fail (both sides behind symmetric NAT is the hard case; no relay server exists to fall back on). Use `-6` if both sides have IPv6 -- it bypasses NAT entirely.
 
-If both peers are on the same LAN, it will connect via local addresses.
+With **IPv6** (`-6`): NAT does not exist, so all of the above cases are irrelevant. The only requirement is that both peers have a globally routable IPv6 address and that their firewall allows inbound UDP.
+
+If both peers are on the same LAN, it will connect via local addresses regardless of which mode is used.
 
 ## Crypto
 
@@ -123,15 +140,15 @@ These are constants near the top of the file. Adjust them if needed.
 
 - Python 3.6+
 - Network access to at least one of Google's STUN servers (outbound UDP to port 19302)
-- A NAT that isn't symmetric on both ends
+- IPv4: a NAT that isn't symmetric on both ends
+- IPv6 (`-6`): a globally routable IPv6 address on both sides and a firewall that allows inbound UDP
 
 No `pip install`. No virtualenv. Just the one file.
 
 ## Limitations
 
-- **No relay fallback.** If hole punching fails (symmetric NAT on both sides, aggressive firewall), there's no TURN server to fall through to. The connection just fails.
+- **No relay fallback.** If hole punching fails (symmetric NAT on both sides, aggressive firewall), there's no TURN server to fall through to. The connection just fails. Use `-6` if both sides have IPv6 -- it sidesteps this entirely.
 - **Single file only.** To send a directory, tar/zip it first.
-- **IPv4 only.** No IPv6 support in the STUN client or address encoding.
 - **Manual resume only.** If the transfer drops, restart `recv` with the `--resume` command printed by the previous attempt. Resume depends on keeping the preserved partial/temp file.
 - **Non-standard crypto.** The stream cipher is homebrew. It's built from solid primitives (SHA-256, HMAC, PBKDF2, DH) but the composition hasn't been formally analyzed. See the warning above.
 

@@ -7,8 +7,8 @@ Works behind most NATs (full-cone, address-restricted, port-restricted).
 Symmetric NATs may fail without a relay -- that's a hard networking limit.
 
 Usage:
-    python p2p.py send <file> [--connect-timeout SECONDS] [--verbose]
-    python p2p.py recv        [--connect-timeout SECONDS] [--resume PARTIAL_FILE] [--verbose]
+    python p2p.py send <file> [-6] [--connect-timeout SECONDS] [--verbose]
+    python p2p.py recv        [-6] [--connect-timeout SECONDS] [--resume PARTIAL_FILE] [--verbose]
 
   --connect-timeout controls how long (in seconds) both sides will wait
   during the hole-punch and initial handshake phases.  Default is 3600s
@@ -98,7 +98,8 @@ T_HASHR   = 9   # sender replies with SHA-256 hash
 # Receive buffer (UDP max)
 RECV_BUF = 65536
 
-VERBOSE = False
+VERBOSE  = False
+USE_IPV6 = False
 
 
 def _vprint(*args, **kwargs):
@@ -229,11 +230,28 @@ _STUN_MAGIC = 0x2112A442
 
 
 def _stun_transact(sock, server):
-    """Send a STUN Binding Request and parse the response."""
+    """Send a STUN Binding Request and parse the response.
+
+    *server* is a *(hostname, port)* 2-tuple.  The hostname is resolved to
+    the address family currently in use (IPv4 or IPv6) via getaddrinfo so
+    that AF_INET6 sockets get a proper 4-tuple for sendto.
+
+    Parses both IPv4 and IPv6 XOR-MAPPED-ADDRESS / MAPPED-ADDRESS attributes.
+    """
+    host, port = server
+    family = socket.AF_INET6 if USE_IPV6 else socket.AF_INET
+    try:
+        infos = socket.getaddrinfo(host, port, family, socket.SOCK_DGRAM)
+        if not infos:
+            return None
+        server_addr = infos[0][4]   # full address tuple for sendto
+    except OSError:
+        return None
+
     txn_id = secrets.token_bytes(12)
     req = struct.pack("!HHI", 0x0001, 0, _STUN_MAGIC) + txn_id
     try:
-        sock.sendto(req, server)
+        sock.sendto(req, server_addr)
     except OSError:
         return None
 
@@ -264,16 +282,26 @@ def _stun_transact(sock, server):
         if len(aval) < alen:
             break
 
-        if atype == 0x0020 and alen >= 8:   # XOR-MAPPED-ADDRESS
-            if aval[1] == 0x01:             # IPv4
+        if atype == 0x0020:                         # XOR-MAPPED-ADDRESS
+            if alen >= 8 and aval[1] == 0x01:       # IPv4
                 xport = struct.unpack("!H", aval[2:4])[0] ^ (_STUN_MAGIC >> 16)
                 xip   = struct.unpack("!I", aval[4:8])[0] ^ _STUN_MAGIC
                 return socket.inet_ntoa(struct.pack("!I", xip)), xport
+            elif alen >= 20 and aval[1] == 0x02:    # IPv6
+                xport   = struct.unpack("!H", aval[2:4])[0] ^ (_STUN_MAGIC >> 16)
+                # XOR key: 4-byte magic cookie + 12-byte transaction ID
+                xor_key = struct.pack("!I", _STUN_MAGIC) + txn_id
+                ip_bytes = bytes(aval[4 + i] ^ xor_key[i] for i in range(16))
+                return socket.inet_ntop(socket.AF_INET6, ip_bytes), xport
 
-        elif atype == 0x0001 and alen >= 8:  # MAPPED-ADDRESS (fallback)
-            if aval[1] == 0x01:
+        elif atype == 0x0001:                       # MAPPED-ADDRESS (fallback)
+            if alen >= 8 and aval[1] == 0x01:       # IPv4
                 port = struct.unpack("!H", aval[2:4])[0]
                 ip   = socket.inet_ntoa(aval[4:8])
+                return ip, port
+            elif alen >= 20 and aval[1] == 0x02:    # IPv6
+                port = struct.unpack("!H", aval[2:4])[0]
+                ip   = socket.inet_ntop(socket.AF_INET6, aval[4:20])
                 return ip, port
 
         pos += 4 + alen + ((4 - alen % 4) % 4)
@@ -290,15 +318,65 @@ def stun_discover(sock):
 
 
 def get_local_ip():
-    """Best-effort LAN IP (not 127.0.0.1)."""
+    """Best-effort local IP (not 127.0.0.1 / ::1).
+
+    For IPv6, connecting to Google's public IPv6 DNS lets the OS pick the
+    right source address without sending any real traffic -- same trick as
+    the IPv4 version, just using a different family and remote address.
+    With IPv6 there is no NAT, so this local address IS the public address.
+    """
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
+        if USE_IPV6:
+            s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+            s.connect(("2001:4860:4860::8888", 80, 0, 0))
+        else:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
         ip = s.getsockname()[0]
         s.close()
         return ip
     except Exception:
-        return "127.0.0.1"
+        return "::1" if USE_IPV6 else "127.0.0.1"
+
+
+# ---------------------------------------------------------------------------
+# Address helpers  (IPv4/IPv6 transparent)
+# ---------------------------------------------------------------------------
+
+def _ip_pack(addr: str) -> bytes:
+    """Encode an IP string to 4 bytes (IPv4) or 16 bytes (IPv6)."""
+    if USE_IPV6:
+        return socket.inet_pton(socket.AF_INET6, addr)
+    return socket.inet_aton(addr)
+
+
+def _ip_unpack(data: bytes, off: int):
+    """Decode an IP from *data* starting at *off*.
+    Returns *(ip_string, new_offset)*."""
+    if USE_IPV6:
+        return socket.inet_ntop(socket.AF_INET6, data[off:off + 16]), off + 16
+    return socket.inet_ntoa(data[off:off + 4]), off + 4
+
+
+def _addr_tuple(ip: str, port: int) -> tuple:
+    """Full address tuple for sock.sendto / sock.connect.
+    IPv4 → (ip, port); IPv6 → (ip, port, 0, 0)."""
+    if USE_IPV6:
+        return (ip, port, 0, 0)
+    return (ip, port)
+
+
+def _norm_addr(addr) -> tuple:
+    """Collapse any address tuple to a plain *(ip, port)* 2-tuple.
+    Needed because IPv6 recvfrom returns a 4-tuple."""
+    return (addr[0], addr[1])
+
+
+def _fmt_addr(ip: str, port: int) -> str:
+    """Human-readable address.  IPv6 addresses are bracketed: [::1]:12345."""
+    if USE_IPV6:
+        return f"[{ip}]:{port}"
+    return f"{ip}:{port}"
 
 
 # ===============================================================================
@@ -699,33 +777,63 @@ def _words_to_bytes(phrase: str, expected_bytes: int) -> bytes:
 
 
 def encode_sender_code(secret, salt, pub_ip, pub_port, local_ip, local_port):
+    """Pack a sender code.
+
+    IPv4: 16+16+4+2+4+2 = 44 bytes → 36 words
+    IPv6: 16+16+16+2+16+2 = 68 bytes → 55 words
+    """
     data = (
         secret
         + salt
-        + socket.inet_aton(pub_ip)
+        + _ip_pack(pub_ip)
         + struct.pack("!H", pub_port)
-        + socket.inet_aton(local_ip)
+        + _ip_pack(local_ip)
         + struct.pack("!H", local_port)
     )
     return _bytes_to_words(data)
 
 
 def decode_sender_code(code):
-    data       = _words_to_bytes(code, 44)
+    """Unpack a sender code.  Auto-detects IPv4/IPv6 from word count.
+
+    Returns *(secret, salt, pub_ip, pub_port, local_ip, local_port, is_ipv6)*.
+    Raises *ValueError* on bad input.
+    """
+    words = code.strip().lower().split()
+    nw = len(words)
+    if nw == 36:        # IPv4 code: 44 bytes
+        total, ipv6 = 44, False
+    elif nw == 55:      # IPv6 code: 68 bytes
+        total, ipv6 = 68, True
+    else:
+        raise ValueError(f"Invalid sender code: expected 36 or 55 words, got {nw}")
+
+    data       = _words_to_bytes(code, total)
     secret     = data[:16]
     salt       = data[16:32]
-    pub_ip     = socket.inet_ntoa(data[32:36])
-    pub_port   = struct.unpack("!H", data[36:38])[0]
-    local_ip   = socket.inet_ntoa(data[38:42])
-    local_port = struct.unpack("!H", data[42:44])[0]
-    return secret, salt, pub_ip, pub_port, local_ip, local_port
+    if ipv6:
+        pub_ip     = socket.inet_ntop(socket.AF_INET6, data[32:48])
+        pub_port   = struct.unpack("!H", data[48:50])[0]
+        local_ip   = socket.inet_ntop(socket.AF_INET6, data[50:66])
+        local_port = struct.unpack("!H", data[66:68])[0]
+    else:
+        pub_ip     = socket.inet_ntoa(data[32:36])
+        pub_port   = struct.unpack("!H", data[36:38])[0]
+        local_ip   = socket.inet_ntoa(data[38:42])
+        local_port = struct.unpack("!H", data[42:44])[0]
+    return secret, salt, pub_ip, pub_port, local_ip, local_port, ipv6
 
 
 def encode_recv_code(pub_ip, pub_port, local_ip, local_port, secret):
+    """Pack a receiver code.
+
+    IPv4: 4+2+4+2+16(HMAC) = 28 bytes → 23 words
+    IPv6: 16+2+16+2+16(HMAC) = 52 bytes → 42 words
+    """
     raw = (
-        socket.inet_aton(pub_ip)
+        _ip_pack(pub_ip)
         + struct.pack("!H", pub_port)
-        + socket.inet_aton(local_ip)
+        + _ip_pack(local_ip)
         + struct.pack("!H", local_port)
     )
     tag = _hmac.new(secret, raw, hashlib.sha256).digest()[:16]
@@ -733,15 +841,35 @@ def encode_recv_code(pub_ip, pub_port, local_ip, local_port, secret):
 
 
 def decode_recv_code(code, secret):
-    data     = _words_to_bytes(code, 28)
-    raw, tag = data[:12], data[12:28]
-    expected = _hmac.new(secret, raw, hashlib.sha256).digest()[:16]
-    if not _hmac.compare_digest(tag, expected):
+    """Unpack a receiver code.  Auto-detects IPv4/IPv6 from word count.
+
+    Returns *(pub_ip, pub_port, local_ip, local_port)* or *None* on HMAC failure.
+    Returns *None* for unknown word counts too.
+    """
+    words = code.strip().lower().split()
+    nw = len(words)
+    if nw == 23:        # IPv4: 28 bytes, raw = 12 B, tag = 16 B
+        data     = _words_to_bytes(code, 28)
+        raw, tag = data[:12], data[12:28]
+        expected = _hmac.new(secret, raw, hashlib.sha256).digest()[:16]
+        if not _hmac.compare_digest(tag, expected):
+            return None
+        pub_ip     = socket.inet_ntoa(raw[0:4])
+        pub_port   = struct.unpack("!H", raw[4:6])[0]
+        local_ip   = socket.inet_ntoa(raw[6:10])
+        local_port = struct.unpack("!H", raw[10:12])[0]
+    elif nw == 42:      # IPv6: 52 bytes, raw = 36 B, tag = 16 B
+        data     = _words_to_bytes(code, 52)
+        raw, tag = data[:36], data[36:52]
+        expected = _hmac.new(secret, raw, hashlib.sha256).digest()[:16]
+        if not _hmac.compare_digest(tag, expected):
+            return None
+        pub_ip     = socket.inet_ntop(socket.AF_INET6, raw[0:16])
+        pub_port   = struct.unpack("!H", raw[16:18])[0]
+        local_ip   = socket.inet_ntop(socket.AF_INET6, raw[18:34])
+        local_port = struct.unpack("!H", raw[34:36])[0]
+    else:
         return None
-    pub_ip     = socket.inet_ntoa(raw[0:4])
-    pub_port   = struct.unpack("!H", raw[4:6])[0]
-    local_ip   = socket.inet_ntoa(raw[6:10])
-    local_port = struct.unpack("!H", raw[10:12])[0]
     return pub_ip, pub_port, local_ip, local_port
 
 
@@ -773,10 +901,13 @@ def punch_hole(sock, cipher, pub_addr, local_addr, dh_pub_bytes,
        transient network errors (including Windows ICMP port-unreachable
        feedback, WinError 10054) never propagate as uncaught exceptions.
     """
+    # targets: normalized (ip, port) 2-tuples for membership checks
     targets = set()
     targets.add(pub_addr)
     if local_addr and local_addr != pub_addr:
         targets.add(local_addr)
+    # Full address tuples for sendto: IPv4 → 2-tuple, IPv6 → 4-tuple
+    targets_send = [_addr_tuple(ip, port) for ip, port in targets]
 
     # Flush stale packets before we start listening.
     _drain_socket(sock)
@@ -791,7 +922,7 @@ def punch_hole(sock, cipher, pub_addr, local_addr, dh_pub_bytes,
 
     while time.time() - start < timeout:
         # Send a salvo to every target
-        for t in targets:
+        for t in targets_send:
             try:
                 sock.sendto(hello_pkt, t)
             except OSError:
@@ -808,7 +939,7 @@ def punch_hole(sock, cipher, pub_addr, local_addr, dh_pub_bytes,
             if not ready[0]:
                 continue
             try:
-                data, addr = sock.recvfrom(RECV_BUF)
+                data, addr_raw = sock.recvfrom(RECV_BUF)
             except OSError:
                 continue
 
@@ -818,6 +949,7 @@ def punch_hole(sock, cipher, pub_addr, local_addr, dh_pub_bytes,
             # stale HELLO from a previously cancelled receiver from being
             # accepted as the "connection", which would make the sender target
             # a now-closed port and crash with WinError 10054 on the next recv.
+            addr = _norm_addr(addr_raw)   # IPv6 4-tuple → plain (ip, port)
             if addr not in targets:
                 continue
             # --------------------------------------------------------------------
@@ -828,17 +960,18 @@ def punch_hole(sock, cipher, pub_addr, local_addr, dh_pub_bytes,
                 if len(peer_dh_pub) != _DH_KEY_BYTES:
                     continue   # malformed -- ignore
                 # Confirm the path with a few extra HELLOs
+                addr_full = _addr_tuple(*addr)
                 for _ in range(5):
                     try:
-                        sock.sendto(hello_pkt, addr)
+                        sock.sendto(hello_pkt, addr_full)
                     except OSError:
                         pass
                     time.sleep(0.05)
                 if VERBOSE:
-                    print(f"\n  Connected to {addr[0]}:{addr[1]}")
+                    print(f"\n  Connected to {_fmt_addr(*addr)}")
                 else:
                     print("\n  Connected.")
-                return addr, peer_dh_pub
+                return addr_full, peer_dh_pub
             # Any other packet type here (e.g. T_META from a racing sender)
             # is silently ignored; punch_hole only cares about HELLOs.
 
@@ -1445,8 +1578,9 @@ def _fmt(n):
 
 def _partial_saved_msg(working_path):
     """Print a consistent 'partial file kept' message on any mid-transfer failure."""
+    ipv6_flag = " -6" if USE_IPV6 else ""
     print(f"  Partial file saved: {working_path}")
-    print(f"  To resume:          python p2p.py recv --resume \"{working_path}\"")
+    print(f"  To resume:          python p2p.py recv{ipv6_flag} --resume \"{working_path}\"")
 
 
 # ===============================================================================
@@ -1657,14 +1791,21 @@ def cmd_send(filepath, connect_timeout=CONNECT_TIMEOUT):
     filehash = sha.hexdigest()
 
     # ---- Bind UDP socket ----------------------------------------------------
+    family    = socket.AF_INET6 if USE_IPV6 else socket.AF_INET
+    bind_host = "::" if USE_IPV6 else ""
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.bind(("", 0))
+        sock = socket.socket(family, socket.SOCK_DGRAM)
+        if USE_IPV6:
+            try:
+                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            except (AttributeError, OSError):
+                pass
+        sock.bind((bind_host, 0))
     except OSError as e:
         print(f"  Error: cannot create UDP socket: {e}")
         sys.exit(1)
 
-    local_port = sock.getsockname()[1]
+    local_port = sock.getsockname()[1]   # index 1 = port for both AF families
     local_ip   = get_local_ip()
 
     # ---- STUN ---------------------------------------------------------------
@@ -1673,15 +1814,21 @@ def cmd_send(filepath, connect_timeout=CONNECT_TIMEOUT):
     if pub:
         pub_ip, pub_port = pub
         try:
-            socket.inet_aton(pub_ip)   # guard: only IPv4 is supported in codes
-            _vprint(f"  Public : {pub_ip}:{pub_port}")
+            if USE_IPV6:
+                socket.inet_pton(socket.AF_INET6, pub_ip)
+            else:
+                socket.inet_aton(pub_ip)   # guard: only same-family addresses
+            _vprint(f"  Public : {_fmt_addr(pub_ip, pub_port)}")
         except OSError:
             pub_ip, pub_port = local_ip, local_port
-            _vprint("  STUN returned a non-IPv4 address -- using local address.")
+            _vprint("  STUN returned wrong-family address -- using local address.")
     else:
         pub_ip, pub_port = local_ip, local_port
-        _vprint("  STUN failed -- using local address (LAN-only transfer).")
-    _vprint(f"  Local  : {local_ip}:{local_port}")
+        if USE_IPV6:
+            _vprint("  STUN failed -- using local IPv6 address (IPv6 has no NAT).")
+        else:
+            _vprint("  STUN failed -- using local address (LAN-only transfer).")
+    _vprint(f"  Local  : {_fmt_addr(local_ip, local_port)}")
     secret = secrets.token_bytes(16)
     salt   = secrets.token_bytes(16)
     code   = encode_sender_code(secret, salt, pub_ip, pub_port, local_ip, local_port)
@@ -1707,6 +1854,20 @@ def cmd_send(filepath, connect_timeout=CONNECT_TIMEOUT):
         sock.close()
         sys.exit(1)
 
+    # Detect IPv4/IPv6 mismatch before decoding
+    _rwords = rcode.strip().lower().split()
+    _expected_rwords = 42 if USE_IPV6 else 23
+    if len(_rwords) != _expected_rwords:
+        print("  Error: invalid receiver code.")
+        if not USE_IPV6 and len(_rwords) == 42:
+            print("  The receiver is using IPv6 (-6). Re-run: python p2p.py send <file> -6")
+        elif USE_IPV6 and len(_rwords) == 23:
+            print("  The receiver is using IPv4. Both sides must agree on -6 (or neither).")
+        else:
+            print("  Make sure you copied the entire RECV CODE from the receiver's screen.")
+        sock.close()
+        sys.exit(1)
+
     result = decode_recv_code(rcode, secret)
     if result is None:
         print("  Error: invalid receiver code.")
@@ -1716,8 +1877,8 @@ def cmd_send(filepath, connect_timeout=CONNECT_TIMEOUT):
         sys.exit(1)
 
     peer_pub_ip, peer_pub_port, peer_local_ip, peer_local_port = result
-    _vprint(f"  Peer public : {peer_pub_ip}:{peer_pub_port}")
-    _vprint(f"  Peer local  : {peer_local_ip}:{peer_local_port}")
+    _vprint(f"  Peer public : {_fmt_addr(peer_pub_ip, peer_pub_port)}")
+    _vprint(f"  Peer local  : {_fmt_addr(peer_local_ip, peer_local_port)}")
 
     # ---- Handshake ----------------------------------------------------------
     _vprint("  Deriving handshake keys (PBKDF2, 100k rounds)...")
@@ -1777,14 +1938,21 @@ def cmd_recv(connect_timeout=CONNECT_TIMEOUT, max_size=MAX_FILE_SIZE, resume_pat
     save_dir = "."
 
     # ---- Bind ---------------------------------------------------------------
+    family    = socket.AF_INET6 if USE_IPV6 else socket.AF_INET
+    bind_host = "::" if USE_IPV6 else ""
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.bind(("", 0))
+        sock = socket.socket(family, socket.SOCK_DGRAM)
+        if USE_IPV6:
+            try:
+                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            except (AttributeError, OSError):
+                pass
+        sock.bind((bind_host, 0))
     except OSError as e:
         print(f"  Error: cannot create UDP socket: {e}")
         sys.exit(1)
 
-    local_port = sock.getsockname()[1]
+    local_port = sock.getsockname()[1]   # index 1 = port for both AF families
     local_ip   = get_local_ip()
 
     # ---- STUN ---------------------------------------------------------------
@@ -1793,15 +1961,21 @@ def cmd_recv(connect_timeout=CONNECT_TIMEOUT, max_size=MAX_FILE_SIZE, resume_pat
     if pub:
         pub_ip, pub_port = pub
         try:
-            socket.inet_aton(pub_ip)   # guard: only IPv4 is supported in codes
-            _vprint(f"  Public : {pub_ip}:{pub_port}")
+            if USE_IPV6:
+                socket.inet_pton(socket.AF_INET6, pub_ip)
+            else:
+                socket.inet_aton(pub_ip)   # guard: only same-family addresses
+            _vprint(f"  Public : {_fmt_addr(pub_ip, pub_port)}")
         except OSError:
             pub_ip, pub_port = local_ip, local_port
-            _vprint("  STUN returned a non-IPv4 address -- using local address.")
+            _vprint("  STUN returned wrong-family address -- using local address.")
     else:
         pub_ip, pub_port = local_ip, local_port
-        _vprint("  STUN failed -- using local address (LAN-only transfer).")
-    _vprint(f"  Local  : {local_ip}:{local_port}")
+        if USE_IPV6:
+            _vprint("  STUN failed -- using local IPv6 address (IPv6 has no NAT).")
+        else:
+            _vprint("  STUN failed -- using local address (LAN-only transfer).")
+    _vprint(f"  Local  : {_fmt_addr(local_ip, local_port)}")
 
     # ---- Get sender code ----------------------------------------------------
     print()
@@ -1818,7 +1992,7 @@ def cmd_recv(connect_timeout=CONNECT_TIMEOUT, max_size=MAX_FILE_SIZE, resume_pat
         sys.exit(1)
 
     try:
-        secret, salt, peer_pub_ip, peer_pub_port, peer_local_ip, peer_local_port = (
+        secret, salt, peer_pub_ip, peer_pub_port, peer_local_ip, peer_local_port, code_ipv6 = (
             decode_sender_code(scode)
         )
     except Exception:
@@ -1827,8 +2001,17 @@ def cmd_recv(connect_timeout=CONNECT_TIMEOUT, max_size=MAX_FILE_SIZE, resume_pat
         sock.close()
         sys.exit(1)
 
-    _vprint(f"  Peer public : {peer_pub_ip}:{peer_pub_port}")
-    _vprint(f"  Peer local  : {peer_local_ip}:{peer_local_port}")
+    if code_ipv6 != USE_IPV6:
+        print("  Error: address-family mismatch.")
+        if code_ipv6:
+            print("  The sender is using IPv6 (-6). Re-run: python p2p.py recv -6")
+        else:
+            print("  The sender is using IPv4. Both sides must agree on -6 (or neither).")
+        sock.close()
+        sys.exit(1)
+
+    _vprint(f"  Peer public : {_fmt_addr(peer_pub_ip, peer_pub_port)}")
+    _vprint(f"  Peer local  : {_fmt_addr(peer_local_ip, peer_local_port)}")
 
     # ---- Display RECV CODE --------------------------------------------------
     rcode = encode_recv_code(pub_ip, pub_port, local_ip, local_port, secret)
@@ -1934,9 +2117,11 @@ def main():
 
     if len(sys.argv) < 2 or "-h" in sys.argv[1:] or "--help" in sys.argv[1:]:
         print("  Usage:")
-        print("    python p2p.py send <file> [--connect-timeout SECONDS] [--verbose]")
-        print("    python p2p.py recv        [--connect-timeout SECONDS] [--resume PARTIAL_FILE] [--verbose]")
+        print("    python p2p.py send <file> [-6] [--connect-timeout SECONDS] [--verbose]")
+        print("    python p2p.py recv        [-6] [--connect-timeout SECONDS] [--resume PARTIAL_FILE] [--verbose]")
         print()
+        print("  -6                 Use IPv6 (both sides must agree). Bypasses NAT")
+        print("                     entirely -- works wherever IPv6 is available.")
         print("  --connect-timeout  Seconds to wait during hole-punch and")
         print(f"                     handshake phases (default: {CONNECT_TIMEOUT}).")
         print("  --resume FILE      Resume a dropped transfer. Point to the partial")
@@ -1951,6 +2136,7 @@ def main():
     connect_timeout = CONNECT_TIMEOUT
     resume_path     = None
     verbose         = False
+    use_ipv6        = False
     filtered        = []
     i = 0
     while i < len(args):
@@ -1969,12 +2155,16 @@ def main():
         elif args[i] == "--verbose":
             verbose = True
             i += 1
+        elif args[i] in ("-6", "--ipv6"):
+            use_ipv6 = True
+            i += 1
         else:
             filtered.append(args[i])
             i += 1
     args = filtered
-    global VERBOSE
-    VERBOSE = verbose
+    global VERBOSE, USE_IPV6
+    VERBOSE  = verbose
+    USE_IPV6 = use_ipv6
 
     if not args:
         print("  Use 'send' or 'recv'.  Run with -h for help.")
@@ -1985,7 +2175,7 @@ def main():
     try:
         if cmd == "send":
             if len(args) < 2:
-                print("  Usage: python p2p.py send <file>")
+                print("  Usage: python p2p.py send <file> [-6]")
                 sys.exit(1)
             cmd_send(args[1], connect_timeout=connect_timeout)
 

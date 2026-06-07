@@ -14,6 +14,13 @@ python p2p.py send photo.jpg
 
 You'll get a send code (36 words). Give it to the receiver over any channel -- text, email, Discord, whatever.
 
+By default, the app hides technical connection details like IP addresses and STUN/handshake status. Add `--verbose` if you want to see those details:
+
+```
+python p2p.py send photo.jpg --verbose
+python p2p.py recv --verbose
+```
+
 **Receive a file:**
 
 ```

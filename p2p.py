@@ -7,13 +7,15 @@ Works behind most NATs (full-cone, address-restricted, port-restricted).
 Symmetric NATs may fail without a relay -- that's a hard networking limit.
 
 Usage:
-    python p2p.py send <file> [--connect-timeout SECONDS]
-    python p2p.py recv        [--connect-timeout SECONDS]
+    python p2p.py send <file> [--connect-timeout SECONDS] [--verbose]
+    python p2p.py recv        [--connect-timeout SECONDS] [--resume PARTIAL_FILE] [--verbose]
 
   --connect-timeout controls how long (in seconds) both sides will wait
   during the hole-punch and initial handshake phases.  Default is 3600s
   (1 hour) so users have plenty of time to exchange codes out-of-band.
   The transfer itself has no time limit -- only packet-loss retries apply.
+  --verbose shows technical connection details such as IP addresses and
+  handshake/STUN status.
 
 Flow:
     1. Sender runs 'send', gets a SEND CODE.
@@ -95,6 +97,13 @@ T_HASHR   = 9   # sender replies with SHA-256 hash
 
 # Receive buffer (UDP max)
 RECV_BUF = 65536
+
+VERBOSE = False
+
+
+def _vprint(*args, **kwargs):
+    if VERBOSE:
+        print(*args, **kwargs)
 
 
 # ===============================================================================
@@ -722,7 +731,8 @@ def punch_hole(sock, cipher, pub_addr, local_addr, dh_pub_bytes,
     hello_pkt     = cipher.encrypt(T_HELLO, hello_payload)
     start         = time.time()
 
-    sys.stdout.write("  Punching through NAT...")
+    status = "Punching through NAT..." if VERBOSE else "Connecting..."
+    sys.stdout.write(f"  {status}")
     sys.stdout.flush()
 
     while time.time() - start < timeout:
@@ -770,19 +780,25 @@ def punch_hole(sock, cipher, pub_addr, local_addr, dh_pub_bytes,
                     except OSError:
                         pass
                     time.sleep(0.05)
-                print(f"\n  Connected to {addr[0]}:{addr[1]}")
+                if VERBOSE:
+                    print(f"\n  Connected to {addr[0]}:{addr[1]}")
+                else:
+                    print("\n  Connected.")
                 return addr, peer_dh_pub
             # Any other packet type here (e.g. T_META from a racing sender)
             # is silently ignored; punch_hole only cares about HELLOs.
 
         elapsed = int(time.time() - start)
         if elapsed >= 60:
-            sys.stdout.write(f"\r  Punching through NAT... {elapsed // 60}m {elapsed % 60}s  ")
+            sys.stdout.write(f"\r  {status} {elapsed // 60}m {elapsed % 60}s  ")
         else:
-            sys.stdout.write(f"\r  Punching through NAT... {elapsed}s  ")
+            sys.stdout.write(f"\r  {status} {elapsed}s  ")
         sys.stdout.flush()
 
-    print("\n  Hole punch timed out.")
+    if VERBOSE:
+        print("\n  Hole punch timed out.")
+    else:
+        print("\n  Connection timed out.")
     return None, None
 
 
@@ -1351,8 +1367,8 @@ def recv_file_reliable(sock, peer, cipher, connect_timeout=CONNECT_TIMEOUT,
         print("  ERROR: SHA-256 mismatch -- file is corrupted or tampered!")
         print(f"    expected {filehash}")
         print(f"    got      {actual}")
-        print("  The partial data is preserved. If you retry, the resume binary")
-        print("  search will find the last good chunk and re-transfer from there.")
+        print("  The partial data is preserved. You can retry with the resume")
+        print("  command shown below.")
         _partial_saved_msg(working_path)
         return None
     return filename, working_path, filehash
@@ -1544,20 +1560,20 @@ def cmd_send(filepath, connect_timeout=CONNECT_TIMEOUT):
     local_ip   = get_local_ip()
 
     # ---- STUN ---------------------------------------------------------------
-    print("  Discovering public endpoint via STUN...")
+    _vprint("  Discovering public endpoint via STUN...")
     pub = stun_discover(sock)
     if pub:
         pub_ip, pub_port = pub
         try:
             socket.inet_aton(pub_ip)   # guard: only IPv4 is supported in codes
-            print(f"  Public : {pub_ip}:{pub_port}")
+            _vprint(f"  Public : {pub_ip}:{pub_port}")
         except OSError:
             pub_ip, pub_port = local_ip, local_port
-            print("  STUN returned a non-IPv4 address -- using local address.")
+            _vprint("  STUN returned a non-IPv4 address -- using local address.")
     else:
         pub_ip, pub_port = local_ip, local_port
-        print("  STUN failed -- using local address (LAN-only transfer).")
-    print(f"  Local  : {local_ip}:{local_port}")
+        _vprint("  STUN failed -- using local address (LAN-only transfer).")
+    _vprint(f"  Local  : {local_ip}:{local_port}")
     secret = secrets.token_bytes(16)
     salt   = secrets.token_bytes(16)
     code   = encode_sender_code(secret, salt, pub_ip, pub_port, local_ip, local_port)
@@ -1592,11 +1608,11 @@ def cmd_send(filepath, connect_timeout=CONNECT_TIMEOUT):
         sys.exit(1)
 
     peer_pub_ip, peer_pub_port, peer_local_ip, peer_local_port = result
-    print(f"  Peer public : {peer_pub_ip}:{peer_pub_port}")
-    print(f"  Peer local  : {peer_local_ip}:{peer_local_port}")
+    _vprint(f"  Peer public : {peer_pub_ip}:{peer_pub_port}")
+    _vprint(f"  Peer local  : {peer_local_ip}:{peer_local_port}")
 
     # ---- Handshake ----------------------------------------------------------
-    print("  Deriving handshake keys (PBKDF2, 100k rounds)...")
+    _vprint("  Deriving handshake keys (PBKDF2, 100k rounds)...")
     handshake_cipher = Cipher(secret, salt, is_sender=True)
     dh_priv, dh_pub  = _dh_keypair()
 
@@ -1619,7 +1635,10 @@ def cmd_send(filepath, connect_timeout=CONNECT_TIMEOUT):
         print("  Possible causes:")
         print("    - The receiver is not running 'recv' right now")
         print("    - The recv code is from a different session (try again from the start)")
-        print("    - Both sides are behind symmetric NAT (needs a relay server)")
+        if VERBOSE:
+            print("    - Both sides are behind symmetric NAT (needs a relay server)")
+        else:
+            print("    - One of the networks is blocking direct peer-to-peer connections")
         sock.close()
         sys.exit(1)
 
@@ -1630,7 +1649,7 @@ def cmd_send(filepath, connect_timeout=CONNECT_TIMEOUT):
         sock.close()
         sys.exit(1)
 
-    print("  Forward-secret session keys established (DH + PBKDF2).")
+    _vprint("  Forward-secret session keys established (DH + PBKDF2).")
     session_cipher = Cipher(secret + dh_shared, salt, is_sender=True)
 
     # ---- Transfer -----------------------------------------------------------
@@ -1661,20 +1680,20 @@ def cmd_recv(connect_timeout=CONNECT_TIMEOUT, max_size=MAX_FILE_SIZE, resume_pat
     local_ip   = get_local_ip()
 
     # ---- STUN ---------------------------------------------------------------
-    print("  Discovering public endpoint via STUN...")
+    _vprint("  Discovering public endpoint via STUN...")
     pub = stun_discover(sock)
     if pub:
         pub_ip, pub_port = pub
         try:
             socket.inet_aton(pub_ip)   # guard: only IPv4 is supported in codes
-            print(f"  Public : {pub_ip}:{pub_port}")
+            _vprint(f"  Public : {pub_ip}:{pub_port}")
         except OSError:
             pub_ip, pub_port = local_ip, local_port
-            print("  STUN returned a non-IPv4 address -- using local address.")
+            _vprint("  STUN returned a non-IPv4 address -- using local address.")
     else:
         pub_ip, pub_port = local_ip, local_port
-        print("  STUN failed -- using local address (LAN-only transfer).")
-    print(f"  Local  : {local_ip}:{local_port}")
+        _vprint("  STUN failed -- using local address (LAN-only transfer).")
+    _vprint(f"  Local  : {local_ip}:{local_port}")
 
     # ---- Get sender code ----------------------------------------------------
     print()
@@ -1700,8 +1719,8 @@ def cmd_recv(connect_timeout=CONNECT_TIMEOUT, max_size=MAX_FILE_SIZE, resume_pat
         sock.close()
         sys.exit(1)
 
-    print(f"  Peer public : {peer_pub_ip}:{peer_pub_port}")
-    print(f"  Peer local  : {peer_local_ip}:{peer_local_port}")
+    _vprint(f"  Peer public : {peer_pub_ip}:{peer_pub_port}")
+    _vprint(f"  Peer local  : {peer_local_ip}:{peer_local_port}")
 
     # ---- Display RECV CODE --------------------------------------------------
     rcode = encode_recv_code(pub_ip, pub_port, local_ip, local_port, secret)
@@ -1714,7 +1733,7 @@ def cmd_recv(connect_timeout=CONNECT_TIMEOUT, max_size=MAX_FILE_SIZE, resume_pat
     print()
 
     # ---- Handshake ----------------------------------------------------------
-    print("  Deriving handshake keys (PBKDF2, 100k rounds)...")
+    _vprint("  Deriving handshake keys (PBKDF2, 100k rounds)...")
     handshake_cipher = Cipher(secret, salt, is_sender=False)
     dh_priv, dh_pub  = _dh_keypair()
 
@@ -1737,7 +1756,10 @@ def cmd_recv(connect_timeout=CONNECT_TIMEOUT, max_size=MAX_FILE_SIZE, resume_pat
         print("  Possible causes:")
         print("    - The sender has not yet pasted your recv code")
         print("    - The send code you used is from a different session")
-        print("    - Both sides are behind symmetric NAT (needs a relay server)")
+        if VERBOSE:
+            print("    - Both sides are behind symmetric NAT (needs a relay server)")
+        else:
+            print("    - One of the networks is blocking direct peer-to-peer connections")
         sock.close()
         sys.exit(1)
 
@@ -1748,7 +1770,7 @@ def cmd_recv(connect_timeout=CONNECT_TIMEOUT, max_size=MAX_FILE_SIZE, resume_pat
         sock.close()
         sys.exit(1)
 
-    print("  Forward-secret session keys established (DH + PBKDF2).")
+    _vprint("  Forward-secret session keys established (DH + PBKDF2).")
     session_cipher = Cipher(secret + dh_shared, salt, is_sender=False)
 
     # ---- Receive ------------------------------------------------------------
@@ -1802,22 +1824,25 @@ def cmd_recv(connect_timeout=CONNECT_TIMEOUT, max_size=MAX_FILE_SIZE, resume_pat
 def main():
     print(BANNER)
 
-    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+    if len(sys.argv) < 2 or "-h" in sys.argv[1:] or "--help" in sys.argv[1:]:
         print("  Usage:")
-        print("    python p2p.py send <file> [--connect-timeout SECONDS]")
-        print("    python p2p.py recv        [--connect-timeout SECONDS] [--resume PARTIAL_FILE]")
+        print("    python p2p.py send <file> [--connect-timeout SECONDS] [--verbose]")
+        print("    python p2p.py recv        [--connect-timeout SECONDS] [--resume PARTIAL_FILE] [--verbose]")
         print()
         print("  --connect-timeout  Seconds to wait during hole-punch and")
         print(f"                     handshake phases (default: {CONNECT_TIMEOUT}).")
         print("  --resume FILE      Resume a dropped transfer. Point to the partial")
         print("                     file from a previous recv. The script will verify")
         print("                     how much was received correctly and resume from there.")
+        print("  --verbose          Show technical connection details such as IP")
+        print("                     addresses, STUN status, and handshake status.")
         sys.exit(0)
 
     # Parse optional flags
     args            = sys.argv[1:]
     connect_timeout = CONNECT_TIMEOUT
     resume_path     = None
+    verbose         = False
     filtered        = []
     i = 0
     while i < len(args):
@@ -1833,10 +1858,15 @@ def main():
         elif args[i] == "--resume" and i + 1 < len(args):
             resume_path = args[i + 1]
             i += 2
+        elif args[i] == "--verbose":
+            verbose = True
+            i += 1
         else:
             filtered.append(args[i])
             i += 1
     args = filtered
+    global VERBOSE
+    VERBOSE = verbose
 
     if not args:
         print("  Use 'send' or 'recv'.  Run with -h for help.")

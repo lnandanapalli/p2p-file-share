@@ -1452,12 +1452,16 @@ def _precompute_bin_crc32s(filepath, partial_chunks, chunks_per_bin):
 def _resume_binary_search(sock, peer, cipher, partial_path, partial_chunks,
                            chunks_per_bin=RESUME_CHUNKS_PER_BIN):
     """
-    Verify that the partial file matches the sender's file by comparing SHA-256.
-    
+    Hybrid resume strategy: exact prefix check, then go-back-N fallback
+    (up to min(3, available bins) steps), then binary search only when the
+    file has >=3 bins and all 3 go-back steps fail.
     Returns the number of verified-good chunks, or 0 if nothing matches.
     """
-    print("  Verifying partial file with SHA-256...")
-    
+    if partial_chunks == 0:
+        return 0
+
+    print("  Verifying partial file for resume...")
+
     def _query(num_chunks):
         req = struct.pack(">Q", num_chunks)
         for _ in range(20):
@@ -1484,25 +1488,85 @@ def _resume_binary_search(sock, peer, cipher, partial_path, partial_chunks,
             if ptype == T_HASHR and pl and len(pl) >= 40:
                 resp_n = struct.unpack(">Q", pl[:8])[0]
                 if resp_n == num_chunks:
-                    return pl[8:]
+                    return pl[8:40]
         return None
 
-    # Verify the partial file by SHA-256
-    confirmed_chunks = partial_chunks
+    def _verify(num_chunks):
+        # Returns True (match), False (mismatch), or None (no sender response).
+        sender_sha = _query(num_chunks)
+        if sender_sha is None:
+            return None
+        recv_sha = _prefix_sha256_chunks(partial_path, num_chunks)
+        return _hmac.compare_digest(sender_sha[:32], recv_sha)
 
-    sender_sha = _query(confirmed_chunks)
-    if sender_sha is None:
-        print("  ✗ SHA-256 verification failed - no response from sender.")
+    # ---- Exact prefix check (fast path) -------------------------------------
+    result = _verify(partial_chunks)
+    if result is None:
+        print("  Resume verification failed -- no response from sender.")
+        return 0
+    if result:
+        print(f"  Prefix verified. Resuming from chunk {partial_chunks} "
+              f"({_fmt(partial_chunks * CHUNK_SIZE)}).")
+        return partial_chunks
+
+    print(f"  Prefix mismatch at chunk {partial_chunks}. Trying go-back-N...")
+
+    # ---- Go-back-N: step back by chunks_per_bin, up to 3 valid steps --------
+    goback_candidates = []
+    for k in range(1, 4):
+        candidate = partial_chunks - k * chunks_per_bin
+        if candidate <= 0:
+            break
+        goback_candidates.append(candidate)
+
+    num_goback  = len(goback_candidates)   # 0-3
+    last_failed = partial_chunks           # tightest known-bad bound
+
+    for step_idx, candidate in enumerate(goback_candidates):
+        result = _verify(candidate)
+        if result is None:
+            print(f"  No response from sender at chunk {candidate}. Aborting.")
+            return 0
+        if result:
+            print(f"  Go-back-N matched at chunk {candidate} "
+                  f"({_fmt(candidate * CHUNK_SIZE)}) "
+                  f"after {step_idx + 1} step(s).")
+            return candidate
+        last_failed = candidate
+        print(f"  Mismatch at chunk {candidate} "
+              f"(step {step_idx + 1}/{num_goback}).")
+
+    # ---- Binary search: only for files with >=3 bins when all 3 steps fail --
+    if num_goback < 3:
+        print(f"  File has {num_goback} bin(s). All go-back steps exhausted. "
+              f"Cannot resume.")
         return 0
 
-    recv_sha = _prefix_sha256_chunks(partial_path, confirmed_chunks)
+    print("  All go-back-N steps failed. Running binary search...")
 
-    if _hmac.compare_digest(sender_sha[:32], recv_sha):
-        print(f"  ✓ SHA-256 verified. Resuming from {_fmt(confirmed_chunks * CHUNK_SIZE)}.")
-        return confirmed_chunks
-    else:
-        print("  ✗ SHA-256 mismatch - partial file does not match this transfer.")
+    lo = 0            # highest known-good (empty prefix is vacuously good)
+    hi = last_failed  # lowest known-bad
+
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        result = _verify(mid)
+        if result is None:
+            print(f"  No sender response at chunk {mid}. Aborting binary search.")
+            return 0
+        if result:
+            lo = mid
+        else:
+            hi = mid
+
+    if lo == 0:
+        print("  Binary search found no verified prefix. Cannot resume.")
         return 0
+
+    print(f"  Binary search found verified prefix at chunk {lo} "
+          f"({_fmt(lo * CHUNK_SIZE)}).")
+    return lo
+
+
 
 
 # ===============================================================================

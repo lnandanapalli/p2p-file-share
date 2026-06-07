@@ -80,7 +80,7 @@ The shared secret (128 bits, from `secrets.token_bytes`) travels inside the send
 
 | Parameter | Default |
 |---|---|
-| Max file size | 4 GB |
+| Max file size | 4 TiB |
 | Chunk size | 1400 bytes (fits typical MTU) |
 | Send window | 32 packets |
 | Connection timeout | 3600 seconds (1 hour)* |

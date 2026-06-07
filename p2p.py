@@ -78,7 +78,7 @@ CONNECT_TIMEOUT = 3600   # seconds for all connection-phase waits
 PUNCH_INTERVAL = 0.25    # seconds between HELLO salvos
 DONE_TIMEOUT = 60        # seconds for DONE/DONEACK at end of transfer
 STALL_TIMEOUT = 120      # seconds without progress before declaring transfer dead
-MAX_FILE_SIZE = 4 * 1024 * 1024 * 1024   # 4 GB receive limit
+MAX_FILE_SIZE = 4 * 1024 * 1024 * 1024 * 1024   # 4 TiB (32-bit seq limit ~5.46 TiB)
 
 # Packet types
 T_HELLO   = 1

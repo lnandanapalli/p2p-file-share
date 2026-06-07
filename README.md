@@ -2,7 +2,7 @@
 
 Encrypted peer-to-peer file transfer over UDP hole punching. Single file, zero dependencies, nothing beyond the Python 3 standard library.
 
-Think Magic Wormhole, but you don't install anything.
+Like Magic Wormhole, but you don't install anything.
 
 ## Quick start
 
@@ -22,13 +22,34 @@ python p2p.py recv
 
 Paste the sender's code when prompted. You'll get a recv code (23 words) -- give that back to the sender. Once both codes are exchanged, you'll see the filename and file size. Accept or decline the transfer. If accepted, the encrypted transfer begins automatically.
 
-**Optional timeout control:**
+**Resume a dropped transfer:**
+
+```
+python p2p.py recv --resume "tmpabcd1234"
+```
+
+If a receive is interrupted, the script preserves the partial file and prints the exact resume command, for example:
+
+```
+Partial file saved: ./tmpabcd1234
+To resume:          python p2p.py recv --resume "./tmpabcd1234"
+```
+
+Use the partial/temp file path from that message, not the final filename. The script verifies that the partial file belongs to the same transfer and resumes from the verified byte position.
+
+**Optional timeout control and resume:**
 
 By default, both sides wait up to 1 hour during the code-exchange and hole-punch phases. If your users are slow to exchange codes, you can increase it:
 
 ```
 python p2p.py send photo.jpg --connect-timeout 7200
 python p2p.py recv --connect-timeout 7200
+```
+
+To resume a dropped transfer with a custom timeout, use the `--resume` flag with the preserved partial file:
+
+```
+python p2p.py recv --resume "./tmpabcd1234" --connect-timeout 7200
 ```
 
 The `--connect-timeout` parameter (in seconds) controls how long both sides wait during the hole-punch and initial handshake. The file transfer itself has no time limit (only packet-loss retries apply).
@@ -73,6 +94,7 @@ What it does:
 - **Integrity:** SHA-256 hash of the entire file, verified on receive
 - **Replay protection:** Sliding-window nonce tracking
 - **Direction separation:** Independent key pairs for each direction (sender-to-receiver, receiver-to-sender)
+- **Resume capability:** SHA-256 verification of the preserved partial file before resuming from the verified position
 
 The shared secret (128 bits, from `secrets.token_bytes`) travels inside the send code. Anyone who intercepts that code can derive keys, so share it over a reasonably private channel. The DH exchange provides forward secrecy -- even if the code leaks later, previously captured traffic can't be decrypted.
 
@@ -80,7 +102,7 @@ The shared secret (128 bits, from `secrets.token_bytes`) travels inside the send
 
 | Parameter | Default |
 |---|---|
-| Max file size | 4 TiB |
+| Max file size | 1 TB |
 | Chunk size | 1400 bytes (fits typical MTU) |
 | Send window | 32 packets |
 | Connection timeout | 3600 seconds (1 hour)* |
@@ -103,7 +125,7 @@ No `pip install`. No virtualenv. Just the one file.
 - **No relay fallback.** If hole punching fails (symmetric NAT on both sides, aggressive firewall), there's no TURN server to fall through to. The connection just fails.
 - **Single file only.** To send a directory, tar/zip it first.
 - **IPv4 only.** No IPv6 support in the STUN client or address encoding.
-- **No resume.** If the transfer drops, you start over.
+- **Manual resume only.** If the transfer drops, restart `recv` with the `--resume` command printed by the previous attempt. Resume depends on keeping the preserved partial/temp file.
 - **Non-standard crypto.** The stream cipher is homebrew. It's built from solid primitives (SHA-256, HMAC, PBKDF2, DH) but the composition hasn't been formally analyzed. See the warning above.
 
 ## License

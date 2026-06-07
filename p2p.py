@@ -57,6 +57,7 @@ import math
 import tempfile
 import shutil
 import traceback
+import zlib
 
 # ===============================================================================
 # Configuration
@@ -78,7 +79,8 @@ CONNECT_TIMEOUT = 3600   # seconds for all connection-phase waits
 PUNCH_INTERVAL = 0.25    # seconds between HELLO salvos
 DONE_TIMEOUT = 60        # seconds for DONE/DONEACK at end of transfer
 STALL_TIMEOUT = 120      # seconds without progress before declaring transfer dead
-MAX_FILE_SIZE = 4 * 1024 * 1024 * 1024 * 1024   # 4 TiB (32-bit seq limit ~5.46 TiB)
+MAX_FILE_SIZE = 1 * 1024 * 1024 * 1024 * 1024   # 1 TB receive limit
+RESUME_CHUNKS_PER_BIN = 18000   # ~25 MB per binary-search bin (resume negotiation)
 
 # Packet types
 T_HELLO   = 1
@@ -88,6 +90,8 @@ T_ACK     = 4
 T_DONE    = 5
 T_DONEACK = 6
 T_ABORT   = 7   # receiver declined or cancelled
+T_HASHQ   = 8   # receiver asks sender for SHA-256 hash of partial file
+T_HASHR   = 9   # sender replies with SHA-256 hash
 
 # Receive buffer (UDP max)
 RECV_BUF = 65536
@@ -817,6 +821,7 @@ def send_file_reliable(sock, peer, cipher, filepath, filesize, filehash,
     meta_start   = time.time()
     meta_deadline = meta_start + connect_timeout
     last_print   = 0.0
+    resume_seq   = 0   # chunks already received by peer (0 = fresh start)
 
     try:
         while time.time() < meta_deadline:
@@ -834,17 +839,30 @@ def send_file_reliable(sock, peer, cipher, filepath, filesize, filehash,
                 try:
                     raw, _ = sock.recvfrom(RECV_BUF)
                 except OSError:
-                    # On Windows, sending to a closed local port generates an
-                    # ICMP port-unreachable that surfaces as WinError 10054 on
-                    # the next recvfrom.  Swallow it and keep retrying META.
                     continue
-                ptype, pl = cipher.decrypt(raw)
+                try:
+                    ptype, pl = cipher.decrypt(raw)
+                except Exception:
+                    continue
                 if ptype == T_ACK:
                     meta_acked = True
+                    if pl and len(pl) >= 4:
+                        val = struct.unpack(">I", pl[:4])[0]
+                        resume_seq = 0 if val == 0xFFFFFFFF else val
                     break
                 if ptype == T_ABORT:
                     meta_declined = True
                     break
+                if ptype == T_HASHQ and pl and len(pl) >= 8:
+                    # Receiver is asking for SHA-256 of the partial file
+                    try:
+                        n_chunks = struct.unpack(">Q", pl[:8])[0]
+                        hval = _prefix_sha256_chunks(filepath, n_chunks)
+                        response_data = struct.pack(">Q", n_chunks) + hval
+                        response = cipher.encrypt(T_HASHR, response_data)
+                        sock.sendto(response, peer)
+                    except OSError:
+                        pass
 
             elapsed = time.time() - meta_start
             if elapsed - last_print >= 30:
@@ -888,6 +906,12 @@ def send_file_reliable(sock, peer, cipher, filepath, filesize, filehash,
     sent_time   = {}
     retries     = {}
     next_seq    = 0
+
+    if resume_seq > 0:
+        acked    = set(range(resume_seq))
+        next_seq = resume_seq
+        print(f"  Skipping {resume_seq} already-received chunks "
+              f"({_fmt(min(resume_seq * CHUNK_SIZE, filesize))} already at receiver).")
 
     def _get_chunk(seq):
         if seq not in chunk_cache:
@@ -1027,7 +1051,8 @@ def send_file_reliable(sock, peer, cipher, filepath, filesize, filehash,
     return True
 
 
-def recv_file_reliable(sock, peer, cipher, connect_timeout=CONNECT_TIMEOUT):
+def recv_file_reliable(sock, peer, cipher, connect_timeout=CONNECT_TIMEOUT,
+                       max_size=MAX_FILE_SIZE, resume_path=None):
     """
     Receive a file, streaming chunks to a temp file.
     Returns (filename, temp_path, expected_hash) or None on any failure.
@@ -1099,9 +1124,9 @@ def recv_file_reliable(sock, peer, cipher, connect_timeout=CONNECT_TIMEOUT):
             filesize = meta["size"]
             filehash = meta["hash"]
 
-            if filesize > MAX_FILE_SIZE:
+            if filesize > max_size:
                 print(f"\n  File too large ({_fmt(filesize)}). "
-                      f"Limit is {_fmt(MAX_FILE_SIZE)}.")
+                      f"Limit is {_fmt(max_size)}.")
                 _send_abort_signal(sock, cipher, addr, "SIZE")
                 return None
 
@@ -1118,14 +1143,46 @@ def recv_file_reliable(sock, peer, cipher, connect_timeout=CONNECT_TIMEOUT):
                 print("  Transfer declined.")
                 return None
 
+            # ---- Resume negotiation (before sending META-ACK) ---------------
+            confirmed_chunks = 0
+            using_resume     = False
+
+            if resume_path is not None:
+                if not os.path.isfile(resume_path):
+                    print(f"  Resume error: '{resume_path}' not found.")
+                    _send_abort_signal(sock, cipher, addr, "ABORT")
+                    return None
+
+                partial_size = os.path.getsize(resume_path)
+
+                if partial_size == 0:
+                    print("  Partial file is empty -- starting fresh.")
+                elif partial_size > filesize:
+                    print(f"  Resume error: partial file ({_fmt(partial_size)}) is "
+                          f"larger than incoming file ({_fmt(filesize)}). Wrong file?")
+                    _send_abort_signal(sock, cipher, addr, "ABORT")
+                    return None
+                else:
+                    partial_chunks   = math.ceil(partial_size / CHUNK_SIZE)
+                    confirmed_chunks = _resume_binary_search(
+                        sock, addr, cipher, resume_path, partial_chunks
+                    )
+                    if confirmed_chunks == 0:
+                        print("  Partial file does not match this transfer -- "
+                              "cannot resume. Run recv without --resume to start over.")
+                        _send_abort_signal(sock, cipher, addr, "ABORT")
+                        return None
+                    using_resume = True
+
+            ack_seq = confirmed_chunks if using_resume else 0xFFFFFFFF
             try:
-                sock.sendto(cipher.encrypt(T_ACK, struct.pack(">I", 0xFFFFFFFF)), addr)
+                sock.sendto(cipher.encrypt(T_ACK, struct.pack(">I", ack_seq)), addr)
             except OSError:
                 pass
             peer     = addr
-            accepted = (filename, filesize, filehash)
+            accepted = (filename, filesize, filehash, confirmed_chunks, using_resume)
 
-    filename, filesize, filehash = accepted
+    filename, filesize, filehash, confirmed_chunks, using_resume = accepted
     total_chunks = math.ceil(filesize / CHUNK_SIZE) if filesize > 0 else 0
 
     print(f"  Receiving: {filename}  ({_fmt(filesize)})")
@@ -1140,15 +1197,26 @@ def recv_file_reliable(sock, peer, cipher, connect_timeout=CONNECT_TIMEOUT):
             return None
         return filename, tmp.name, filehash
 
-    # ---- Receive DATA chunks, stream to temp file ---------------------------
-    try:
-        tmp = tempfile.NamedTemporaryFile(delete=False, dir=".")
-        os.chmod(tmp.name, 0o600)
-    except OSError as e:
-        print(f"\n  Cannot create temp file: {e}")
-        return None
+    # ---- Open working file (resume in-place or fresh temp) ------------------
+    if using_resume:
+        try:
+            tmp          = open(resume_path, "r+b")
+            working_path = resume_path
+            tmp.seek(confirmed_chunks * CHUNK_SIZE)
+            tmp.truncate()   # discard anything past the verified boundary
+        except OSError as e:
+            print(f"\n  Cannot open partial file for resume: {e}")
+            return None
+    else:
+        try:
+            tmp = tempfile.NamedTemporaryFile(delete=False, dir=".")
+            os.chmod(tmp.name, 0o600)
+            working_path = tmp.name
+        except OSError as e:
+            print(f"\n  Cannot create temp file: {e}")
+            return None
 
-    received_seqs = set()
+    received_seqs = set(range(confirmed_chunks)) if using_resume else set()
     done          = False
     last_recv_t   = time.time()
 
@@ -1160,10 +1228,7 @@ def recv_file_reliable(sock, peer, cipher, connect_timeout=CONNECT_TIMEOUT):
                       f"{STALL_TIMEOUT}s. Sender may have disconnected.")
                 _send_abort_signal(sock, cipher, peer, "STALL")
                 tmp.close()
-                try:
-                    os.unlink(tmp.name)
-                except OSError:
-                    pass
+                _partial_saved_msg(working_path)
                 return None
 
             try:
@@ -1203,10 +1268,7 @@ def recv_file_reliable(sock, peer, cipher, connect_timeout=CONNECT_TIMEOUT):
                         print(f"\n  Disk write error: {e}")
                         _send_abort_signal(sock, cipher, peer, "ERROR")
                         tmp.close()
-                        try:
-                            os.unlink(tmp.name)
-                        except OSError:
-                            pass
+                        _partial_saved_msg(working_path)
                         return None
                     received_seqs.add(seq)
                 # Always ACK (even duplicates) so sender can advance its window
@@ -1234,8 +1296,9 @@ def recv_file_reliable(sock, peer, cipher, connect_timeout=CONNECT_TIMEOUT):
             elif ptype == T_META:
                 # Re-ACK in case sender missed our first META-ACK
                 try:
+                    ack_seq = confirmed_chunks if using_resume else 0xFFFFFFFF
                     sock.sendto(
-                        cipher.encrypt(T_ACK, struct.pack(">I", 0xFFFFFFFF)), addr
+                        cipher.encrypt(T_ACK, struct.pack(">I", ack_seq)), addr
                     )
                 except OSError:
                     pass
@@ -1244,10 +1307,7 @@ def recv_file_reliable(sock, peer, cipher, connect_timeout=CONNECT_TIMEOUT):
                 reason = payload[:200].decode("utf-8", "replace") if payload else "ABORT"
                 print(f"\n  Sender cancelled the transfer ({reason}).")
                 tmp.close()
-                try:
-                    os.unlink(tmp.name)
-                except OSError:
-                    pass
+                _partial_saved_msg(working_path)
                 return None
 
         # ---- Finalize the temp file -----------------------------------------
@@ -1257,19 +1317,17 @@ def recv_file_reliable(sock, peer, cipher, connect_timeout=CONNECT_TIMEOUT):
         except OSError as e:
             print(f"\n  Disk error finalising file: {e}")
             try:
-                os.unlink(tmp.name)
+                tmp.close()
             except OSError:
                 pass
+            _partial_saved_msg(working_path)
             return None
 
     except KeyboardInterrupt:
         _send_abort_signal(sock, cipher, peer, "CANCEL")
         tmp.close()
-        try:
-            os.unlink(tmp.name)
-        except OSError:
-            pass
         print("\n  Cancelled by receiver.")
+        _partial_saved_msg(working_path)
         return None
 
     print(f"\r  Progress: 100%  ({_fmt(filesize)} / {_fmt(filesize)})")
@@ -1277,7 +1335,7 @@ def recv_file_reliable(sock, peer, cipher, connect_timeout=CONNECT_TIMEOUT):
     # ---- Verify end-to-end hash ---------------------------------------------
     sha = hashlib.sha256()
     try:
-        with open(tmp.name, "rb") as f:
+        with open(working_path, "rb") as f:
             while True:
                 blk = f.read(1 << 20)
                 if not blk:
@@ -1285,10 +1343,7 @@ def recv_file_reliable(sock, peer, cipher, connect_timeout=CONNECT_TIMEOUT):
                 sha.update(blk)
     except OSError as e:
         print(f"\n  Cannot read temp file for verification: {e}")
-        try:
-            os.unlink(tmp.name)
-        except OSError:
-            pass
+        _partial_saved_msg(working_path)
         return None
 
     actual = sha.hexdigest()
@@ -1296,14 +1351,11 @@ def recv_file_reliable(sock, peer, cipher, connect_timeout=CONNECT_TIMEOUT):
         print("  ERROR: SHA-256 mismatch -- file is corrupted or tampered!")
         print(f"    expected {filehash}")
         print(f"    got      {actual}")
-        try:
-            os.unlink(tmp.name)
-        except OSError:
-            pass
+        print("  The partial data is preserved. If you retry, the resume binary")
+        print("  search will find the last good chunk and re-transfer from there.")
+        _partial_saved_msg(working_path)
         return None
-
-    print("  Integrity verified (SHA-256).")
-    return filename, tmp.name, filehash
+    return filename, working_path, filehash
 
 
 # ===============================================================================
@@ -1317,6 +1369,124 @@ def _fmt(n):
             return f"{n:.1f} {u}" if u != "B" else f"{n} B"
         n /= 1024
     return f"{n:.1f} TB"
+
+
+def _partial_saved_msg(working_path):
+    """Print a consistent 'partial file kept' message on any mid-transfer failure."""
+    print(f"  Partial file saved: {working_path}")
+    print(f"  To resume:          python p2p.py recv --resume \"{working_path}\"")
+
+
+# ===============================================================================
+# Resume helpers  (prefix hashing + binary search)
+# ===============================================================================
+
+
+def _prefix_crc32_chunks(filepath, num_chunks):
+    """CRC32 of the first num_chunks * CHUNK_SIZE bytes of filepath."""
+    crc = 0
+    remaining = num_chunks * CHUNK_SIZE
+    with open(filepath, "rb") as f:
+        while remaining > 0:
+            blk = f.read(min(65536, remaining))
+            if not blk:
+                break
+            crc = zlib.crc32(blk, crc)
+            remaining -= len(blk)
+    return struct.pack(">I", crc & 0xFFFFFFFF)
+
+def _prefix_sha256_chunks(filepath, num_chunks):
+    """SHA-256 of the first num_chunks * CHUNK_SIZE bytes of filepath."""
+    h = hashlib.sha256()
+    remaining = num_chunks * CHUNK_SIZE
+    with open(filepath, "rb") as f:
+        while remaining > 0:
+            blk = f.read(min(65536, remaining))
+            if not blk:
+                break
+            h.update(blk)
+            remaining -= len(blk)
+    return h.digest()
+
+
+def _precompute_bin_crc32s(filepath, partial_chunks, chunks_per_bin):
+    """
+    Single sequential pass through filepath.
+    Returns a list where result[i] = CRC32(bytes 0 .. (i+1)*chunks_per_bin*CHUNK_SIZE - 1).
+    Unwritten regions (partial final chunk) are treated as zero bytes.
+    Length = ceil(partial_chunks / chunks_per_bin).
+    """
+    snapshots = []
+    crc = 0
+    with open(filepath, "rb") as f:
+        for idx in range(partial_chunks):
+            blk = f.read(CHUNK_SIZE)
+            if not blk:
+                blk = b"\x00" * CHUNK_SIZE
+            elif len(blk) < CHUNK_SIZE:
+                blk = blk + b"\x00" * (CHUNK_SIZE - len(blk))
+            crc = zlib.crc32(blk, crc)
+            if (idx + 1) % chunks_per_bin == 0:
+                snapshots.append(crc & 0xFFFFFFFF)
+    if partial_chunks % chunks_per_bin != 0:
+        snapshots.append(crc & 0xFFFFFFFF)
+    return snapshots
+
+
+def _resume_binary_search(sock, peer, cipher, partial_path, partial_chunks,
+                           chunks_per_bin=RESUME_CHUNKS_PER_BIN):
+    """
+    Verify that the partial file matches the sender's file by comparing SHA-256.
+    
+    Returns the number of verified-good chunks, or 0 if nothing matches.
+    """
+    print("  Verifying partial file with SHA-256...")
+    
+    def _query(num_chunks):
+        req = struct.pack(">Q", num_chunks)
+        for _ in range(20):
+            try:
+                sock.sendto(cipher.encrypt(T_HASHQ, req), peer)
+            except OSError:
+                pass
+            try:
+                rdy = select.select([sock], [], [], 1.0)
+            except OSError:
+                continue
+            if not rdy[0]:
+                continue
+            try:
+                raw, addr = sock.recvfrom(RECV_BUF)
+            except OSError:
+                continue
+            if addr != peer:
+                continue
+            try:
+                ptype, pl = cipher.decrypt(raw)
+            except Exception:
+                continue
+            if ptype == T_HASHR and pl and len(pl) >= 40:
+                resp_n = struct.unpack(">Q", pl[:8])[0]
+                if resp_n == num_chunks:
+                    return pl[8:]
+        return None
+
+    # Verify the partial file by SHA-256
+    confirmed_chunks = partial_chunks
+
+    sender_sha = _query(confirmed_chunks)
+    if sender_sha is None:
+        print("  ✗ SHA-256 verification failed - no response from sender.")
+        return 0
+
+    recv_sha = _prefix_sha256_chunks(partial_path, confirmed_chunks)
+
+    if _hmac.compare_digest(sender_sha[:32], recv_sha):
+        print(f"  ✓ SHA-256 verified. Resuming from {_fmt(confirmed_chunks * CHUNK_SIZE)}.")
+        return confirmed_chunks
+    else:
+        print("  ✗ SHA-256 mismatch - partial file does not match this transfer.")
+        return 0
 
 
 # ===============================================================================
@@ -1476,7 +1646,7 @@ def cmd_send(filepath, connect_timeout=CONNECT_TIMEOUT):
         sys.exit(1)
 
 
-def cmd_recv(connect_timeout=CONNECT_TIMEOUT):
+def cmd_recv(connect_timeout=CONNECT_TIMEOUT, max_size=MAX_FILE_SIZE, resume_path=None):
     save_dir = "."
 
     # ---- Bind ---------------------------------------------------------------
@@ -1583,7 +1753,8 @@ def cmd_recv(connect_timeout=CONNECT_TIMEOUT):
 
     # ---- Receive ------------------------------------------------------------
     result = recv_file_reliable(
-        sock, peer, session_cipher, connect_timeout=connect_timeout
+        sock, peer, session_cipher, connect_timeout=connect_timeout,
+        max_size=max_size, resume_path=resume_path
     )
     sock.close()
 
@@ -1594,11 +1765,20 @@ def cmd_recv(connect_timeout=CONNECT_TIMEOUT):
 
     # ---- Save to disk -------------------------------------------------------
     save_path = os.path.join(save_dir, filename)
+
+    # If we resumed in-place the file is already at its final destination
+    if os.path.abspath(temp_path) == os.path.abspath(save_path):
+        print(f"  Saved: {save_path}")
+        print("  Done -- file received successfully!")
+        return
+
     if os.path.exists(save_path):
-        try:
-            os.unlink(temp_path)
-        except OSError:
-            pass
+        if resume_path is None:
+            # Only delete temp if it's not the user's resume file
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
         print(f"  Error: '{save_path}' already exists. Will not overwrite.")
         print(f"  The received data is in: {temp_path}")
         sys.exit(1)
@@ -1625,15 +1805,19 @@ def main():
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
         print("  Usage:")
         print("    python p2p.py send <file> [--connect-timeout SECONDS]")
-        print("    python p2p.py recv        [--connect-timeout SECONDS]")
+        print("    python p2p.py recv        [--connect-timeout SECONDS] [--resume PARTIAL_FILE]")
         print()
         print("  --connect-timeout  Seconds to wait during hole-punch and")
         print(f"                     handshake phases (default: {CONNECT_TIMEOUT}).")
+        print("  --resume FILE      Resume a dropped transfer. Point to the partial")
+        print("                     file from a previous recv. The script will verify")
+        print("                     how much was received correctly and resume from there.")
         sys.exit(0)
 
-    # Parse optional --connect-timeout N
+    # Parse optional flags
     args            = sys.argv[1:]
     connect_timeout = CONNECT_TIMEOUT
+    resume_path     = None
     filtered        = []
     i = 0
     while i < len(args):
@@ -1645,6 +1829,9 @@ def main():
             except ValueError:
                 print("  Error: --connect-timeout must be a positive integer.")
                 sys.exit(1)
+            i += 2
+        elif args[i] == "--resume" and i + 1 < len(args):
+            resume_path = args[i + 1]
             i += 2
         else:
             filtered.append(args[i])
@@ -1665,7 +1852,7 @@ def main():
             cmd_send(args[1], connect_timeout=connect_timeout)
 
         elif cmd in ("recv", "receive"):
-            cmd_recv(connect_timeout=connect_timeout)
+            cmd_recv(connect_timeout=connect_timeout, resume_path=resume_path)
 
         else:
             print(f"  Unknown command: {cmd!r}")

@@ -167,6 +167,60 @@ def _drain_socket(sock):
         sock.setblocking(True)
 
 
+def _sock_recv_typed(sock, cipher, peer, want, timeout):
+    """
+    Block until a packet of type `want` from `peer` arrives, discarding all
+    other packet types that come in while waiting.  Returns the decrypted
+    payload, or None if `timeout` seconds elapse without a matching packet.
+
+    The key difference from a bare recvfrom loop: on each wakeup the OS
+    buffer is drained completely in a non-blocking burst before going back
+    to select().  This means a pile of stale wrong-type packets in the
+    buffer (e.g. META retransmits during resume negotiation, or duplicate
+    HASHQs that built up while the sender was computing a hash) never each
+    consume a full 1-second timeout slot -- they're all cleared in
+    microseconds and the wait budget is measured in actual wall-clock
+    silence, not packets-of-the-wrong-type.
+    """
+    deadline = time.time() + timeout
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return None
+        try:
+            rdy = select.select([sock], [], [], remaining)
+        except OSError:
+            return None
+        if not rdy[0]:
+            return None
+        # drain the entire OS buffer in one non-blocking burst
+        sock.setblocking(False)
+        found = None
+        try:
+            while True:
+                try:
+                    raw, addr = sock.recvfrom(RECV_BUF)
+                except BlockingIOError:
+                    break   # buffer empty
+                except OSError:
+                    break
+                if addr != peer:
+                    continue
+                try:
+                    ptype, pl = cipher.decrypt(raw)
+                except Exception:
+                    continue
+                if ptype == want:
+                    found = pl
+                    break
+                # wrong type -- discard and keep draining
+        finally:
+            sock.setblocking(True)
+        if found is not None:
+            return found
+        # burst found nothing matching; go back to select with remaining time
+
+
 # ===============================================================================
 # STUN Client  (RFC 5389 -- minimal Binding Request)
 # ===============================================================================
@@ -870,13 +924,15 @@ def send_file_reliable(sock, peer, cipher, filepath, filesize, filehash,
                     meta_declined = True
                     break
                 if ptype == T_HASHQ and pl and len(pl) >= 8:
-                    # Receiver is asking for SHA-256 of the partial file
                     try:
                         n_chunks = struct.unpack(">Q", pl[:8])[0]
                         hval = _prefix_sha256_chunks(filepath, n_chunks)
-                        response_data = struct.pack(">Q", n_chunks) + hval
-                        response = cipher.encrypt(T_HASHR, response_data)
-                        sock.sendto(response, peer)
+                        sock.sendto(cipher.encrypt(T_HASHR,
+                            struct.pack(">Q", n_chunks) + hval), peer)
+                        # hash computation can take seconds; drain any duplicate
+                        # HASHQs that piled up in the buffer during that time
+                        # so the META loop doesn't recompute for each one
+                        _drain_socket(sock)
                     except OSError:
                         pass
 
@@ -1463,32 +1519,20 @@ def _resume_binary_search(sock, peer, cipher, partial_path, partial_chunks,
     print("  Verifying partial file for resume...")
 
     def _query(num_chunks):
+        # Send HASHQ, wait for the matching HASHR.  Retry up to 5 times with
+        # an 8-second window each -- _sock_recv_typed drains wrong-type packets
+        # instantly so the budget measures genuine silence, not noise.
         req = struct.pack(">Q", num_chunks)
-        for _ in range(20):
+        for _ in range(5):
             try:
                 sock.sendto(cipher.encrypt(T_HASHQ, req), peer)
             except OSError:
                 pass
-            try:
-                rdy = select.select([sock], [], [], 1.0)
-            except OSError:
+            pl = _sock_recv_typed(sock, cipher, peer, T_HASHR, 8.0)
+            if pl is None:
                 continue
-            if not rdy[0]:
-                continue
-            try:
-                raw, addr = sock.recvfrom(RECV_BUF)
-            except OSError:
-                continue
-            if addr != peer:
-                continue
-            try:
-                ptype, pl = cipher.decrypt(raw)
-            except Exception:
-                continue
-            if ptype == T_HASHR and pl and len(pl) >= 40:
-                resp_n = struct.unpack(">Q", pl[:8])[0]
-                if resp_n == num_chunks:
-                    return pl[8:40]
+            if len(pl) >= 40 and struct.unpack(">Q", pl[:8])[0] == num_chunks:
+                return pl[8:40]
         return None
 
     def _verify(num_chunks):

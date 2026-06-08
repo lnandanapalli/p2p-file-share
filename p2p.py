@@ -75,12 +75,12 @@ STUN_SERVERS = [
 
 CHUNK_SIZE = 1400   # bytes per DATA packet payload (fits typical MTU)
 WINDOW_SIZE = 32    # max unACKed in-flight packets
-ACK_TIMEOUT = 0.5   # seconds before retransmitting a packet
+ACK_TIMEOUT = 2.5   # seconds before retransmitting; must exceed 2× max round-trip time
 MAX_RETRIES = 200   # per-packet retransmit limit
 CONNECT_TIMEOUT = 3600   # seconds for all connection-phase waits
 PUNCH_INTERVAL = 0.25    # seconds between HELLO salvos
-DONE_TIMEOUT = 60        # seconds for DONE/DONEACK at end of transfer
-STALL_TIMEOUT = 120      # seconds without progress before declaring transfer dead
+DONE_TIMEOUT = 120       # seconds to wait for DONE/DONEACK handshake
+STALL_TIMEOUT = 300      # seconds of no progress before declaring the transfer dead
 MAX_FILE_SIZE = 1 * 1024 * 1024 * 1024 * 1024   # 1 TB receive limit
 RESUME_CHUNKS_PER_BIN = 18000   # ~25 MB per binary-search bin (resume negotiation)
 
@@ -337,6 +337,46 @@ def get_local_ip():
         return ip
     except Exception:
         return "::1" if USE_IPV6 else "127.0.0.1"
+
+
+# ---------------------------------------------------------------------------
+# CG-NAT detection  (IPv4 only)
+# ---------------------------------------------------------------------------
+
+def _is_cgnat(ip: str) -> bool:
+    """Return True if the STUN-reported public IP is in a private or CG-NAT
+    range -- meaning hole-punching will almost certainly fail.
+
+    Only meaningful for IPv4; IPv6 has no CG-NAT equivalent, so this
+    always returns False when USE_IPV6 is set.
+
+    Ranges:
+      10.0.0.0/8       RFC 1918
+      172.16.0.0/12    RFC 1918
+      192.168.0.0/16   RFC 1918
+      100.64.0.0/10    RFC 6598  IANA CG-NAT shared address space
+    """
+    if USE_IPV6:
+        return False
+    try:
+        a, b, c, d = map(int, ip.split("."))
+        if a == 10:                          return True
+        if a == 172 and 16 <= b <= 31:       return True
+        if a == 192 and b == 168:            return True
+        if a == 100 and 64 <= b <= 127:      return True   # RFC 6598
+    except Exception:
+        pass
+    return False
+
+
+_CGNAT_WARNING = """\
+  *** CG-NAT detected ***
+  Your STUN-reported public IP ({ip}) is a private/CG-NAT address.
+  Your ISP is sharing one real public IP across many customers, so
+  direct UDP hole-punching cannot reach your machine and will time out.
+  A relay-capable transfer tool is required in this configuration.
+  Continuing anyway -- direct connection may succeed on some networks.
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -1829,6 +1869,8 @@ def cmd_send(filepath, connect_timeout=CONNECT_TIMEOUT):
         else:
             _vprint("  STUN failed -- using local address (LAN-only transfer).")
     _vprint(f"  Local  : {_fmt_addr(local_ip, local_port)}")
+    if _is_cgnat(pub_ip):
+        print(_CGNAT_WARNING.format(ip=pub_ip))
     secret = secrets.token_bytes(16)
     salt   = secrets.token_bytes(16)
     code   = encode_sender_code(secret, salt, pub_ip, pub_port, local_ip, local_port)
@@ -1904,10 +1946,9 @@ def cmd_send(filepath, connect_timeout=CONNECT_TIMEOUT):
         print("  Possible causes:")
         print("    - The receiver is not running 'recv' right now")
         print("    - The recv code is from a different session (try again from the start)")
-        if VERBOSE:
-            print("    - Both sides are behind symmetric NAT (needs a relay server)")
-        else:
-            print("    - One of the networks is blocking direct peer-to-peer connections")
+        print("    - One or both sides are behind CG-NAT or symmetric NAT")
+        print("    - A firewall is blocking direct peer-to-peer UDP")
+        print("  CG-NAT and symmetric NAT require a relay -- this tool does not provide one.")
         sock.close()
         sys.exit(1)
 
@@ -1976,6 +2017,8 @@ def cmd_recv(connect_timeout=CONNECT_TIMEOUT, max_size=MAX_FILE_SIZE, resume_pat
         else:
             _vprint("  STUN failed -- using local address (LAN-only transfer).")
     _vprint(f"  Local  : {_fmt_addr(local_ip, local_port)}")
+    if _is_cgnat(pub_ip):
+        print(_CGNAT_WARNING.format(ip=pub_ip))
 
     # ---- Get sender code ----------------------------------------------------
     print()
@@ -2047,10 +2090,9 @@ def cmd_recv(connect_timeout=CONNECT_TIMEOUT, max_size=MAX_FILE_SIZE, resume_pat
         print("  Possible causes:")
         print("    - The sender has not yet pasted your recv code")
         print("    - The send code you used is from a different session")
-        if VERBOSE:
-            print("    - Both sides are behind symmetric NAT (needs a relay server)")
-        else:
-            print("    - One of the networks is blocking direct peer-to-peer connections")
+        print("    - One or both sides are behind CG-NAT or symmetric NAT")
+        print("    - A firewall is blocking direct peer-to-peer UDP")
+        print("  CG-NAT and symmetric NAT require a relay -- this tool does not provide one.")
         sock.close()
         sys.exit(1)
 

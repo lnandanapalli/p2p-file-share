@@ -101,6 +101,8 @@ Works behind most consumer NATs (IPv4):
 - **Port-restricted** -- works
 - **Symmetric** -- will likely fail (both sides behind symmetric NAT is the hard case; no relay server exists to fall back on). Use `-6` if both sides have IPv6 -- it bypasses NAT entirely.
 
+**CG-NAT detection:** At startup, the script checks whether STUN reports a private or CG-NAT address (RFC 1918 ranges and RFC 6598 `100.64.0.0/10`). If detected, a warning is printed before attempting the connection. CG-NAT means your ISP is sharing one public IP across many customers; direct UDP hole-punching cannot reach your machine in that configuration, and this tool has no relay fallback. This check only applies to IPv4; IPv6 has no CG-NAT equivalent.
+
 With **IPv6** (`-6`): NAT does not exist, so all of the above cases are irrelevant. The only requirement is that both peers have a globally routable IPv6 address and that their firewall allows inbound UDP.
 
 If both peers are on the same LAN, it will connect via local addresses regardless of which mode is used.
@@ -129,7 +131,10 @@ The shared secret (128 bits, from `secrets.token_bytes`) travels inside the send
 | Max file size | 1 TB |
 | Chunk size | 1400 bytes (fits typical MTU) |
 | Send window | 32 packets |
+| ACK timeout | 2.5 seconds |
 | Connection timeout | 3600 seconds (1 hour)* |
+| Done handshake timeout | 120 seconds |
+| Stall timeout | 300 seconds |
 | Per-packet retries | 200 |
 
 *Covers hole-punch, code exchange, and handshake phases. Override with `--connect-timeout`.
@@ -147,7 +152,7 @@ No `pip install`. No virtualenv. Just the one file.
 
 ## Limitations
 
-- **No relay fallback.** If hole punching fails (symmetric NAT on both sides, aggressive firewall), there's no TURN server to fall through to. The connection just fails. Use `-6` if both sides have IPv6 -- it sidesteps this entirely.
+- **No relay fallback.** If hole punching fails (symmetric NAT on both sides, CG-NAT, aggressive firewall), there is no TURN server to fall through to. The connection fails. Use `-6` if both sides have IPv6 -- it sidesteps NAT entirely.
 - **Single file only.** To send a directory, tar/zip it first.
 - **Manual resume only.** If the transfer drops, restart `recv` with the `--resume` command printed by the previous attempt. Resume depends on keeping the preserved partial/temp file.
 - **Non-standard crypto.** The stream cipher is homebrew. It's built from solid primitives (SHA-256, HMAC, PBKDF2, DH) but the composition hasn't been formally analyzed. See the warning above.

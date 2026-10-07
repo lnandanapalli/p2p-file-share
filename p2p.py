@@ -4,11 +4,12 @@ p2p.py  --  Zero-dependency encrypted file transfer over UDP hole punching.
 
 Like Magic Wormhole, but needs nothing beyond the Python standard library.
 Works behind most NATs (full-cone, address-restricted, port-restricted).
-Symmetric NATs may fail without a relay -- that's a hard networking limit.
+Symmetric NATs may fail direct hole punching -- that's a hard networking limit.
+For those networks, run both sides with --relay to go through an HTTPS relay.
 
 Usage:
-    python p2p.py send <file> [-6] [--connect-timeout SECONDS] [--verbose]
-    python p2p.py recv        [-6] [--connect-timeout SECONDS] [--resume PARTIAL_FILE] [--verbose]
+    python p2p.py send <file> [-6] [--relay] [--connect-timeout SECONDS] [--verbose]
+    python p2p.py recv        [-6] [--relay] [--connect-timeout SECONDS] [--resume PARTIAL_FILE] [--verbose]
 
   --connect-timeout controls how long (in seconds) both sides will wait
   during the hole-punch and initial handshake phases.  Default is 3600s
@@ -60,6 +61,9 @@ import tempfile
 import shutil
 import traceback
 import zlib
+import http.client
+import threading
+import queue
 
 # ===============================================================================
 # Configuration
@@ -84,6 +88,33 @@ STALL_TIMEOUT = 300      # seconds of no progress before declaring the transfer 
 MAX_FILE_SIZE = 1 * 1024 * 1024 * 1024 * 1024   # 1 TB receive limit
 RESUME_CHUNKS_PER_BIN = 18000   # ~25 MB per binary-search bin (resume negotiation)
 
+# ---- Relay mode (opt-in: only used when BOTH sides pass --relay) -------------
+# Some networks (nested virtualization, libslirp-style outbound-only NAT,
+# CG-NAT, aggressive firewalls) cannot receive unsolicited inbound UDP at
+# all, so no amount of STUN/hole-punching helps. For those, both sides run
+# with --relay: no STUN and no hole punching at all, the same encrypted
+# packets travel through a small HTTPS relay you control instead. Without
+# --relay the relay is never contacted. The relay is a dumb, in-memory
+# pipe -- it never sees plaintext, and all encryption/authentication/ARQ
+# logic below is completely unaware the transport changed.
+RELAY_HOST         = "relay.nlpdf.site"   # point this at your deployed relay
+RELAY_HTTP_TIMEOUT = 25      # seconds; must exceed the relay's long-poll window
+RELAY_FLUSH_WAIT   = 0.02    # seconds; max delay before an outgoing batch flushes
+RELAY_RETRY_SLEEP  = 0.25    # seconds; pause after a failed relay HTTP call
+DIRECT_HINT_AFTER  = 30      # seconds of direct connecting before suggesting --relay
+_DIRECT_HINT = ("\n  Taking a while. If this keeps failing (strict NAT, CG-NAT, VM networking),\n"
+                "  run BOTH sides again with --relay to connect through the relay instead.")
+RELAY_SEND_TIMEOUT = 8       # seconds; sends are short, so a dead path is noticed fast
+RELAY_BACKOFF_MAX  = 10      # seconds; cap on how long a 429/503 Retry-After is honored
+# Connection reuse (keep-alive). Safe by design: any error discards the
+# connection, idle/old connections are never trusted, and a stale one is
+# retried once on a fresh connection. Set RELAY_REUSE_CONN = False to go
+# back to a brand-new HTTPS connection for every request.
+RELAY_REUSE_CONN    = True
+RELAY_CONN_MAX_AGE  = 60     # seconds; recycle a connection after this long
+RELAY_CONN_MAX_REQS = 200    # ...or after this many requests
+RELAY_CONN_MAX_IDLE = 15     # seconds; never reuse a connection idle longer than this
+
 # Packet types
 T_HELLO   = 1
 T_META    = 2
@@ -100,6 +131,7 @@ RECV_BUF = 65536
 
 VERBOSE  = False
 USE_IPV6 = False
+USE_RELAY      = False   # --relay: skip hole punching, use the HTTPS relay only
 
 
 def _vprint(*args, **kwargs):
@@ -919,7 +951,7 @@ def decode_recv_code(code, secret):
 
 
 def punch_hole(sock, cipher, pub_addr, local_addr, dh_pub_bytes,
-               timeout=CONNECT_TIMEOUT):
+               timeout=CONNECT_TIMEOUT, hint=None):
     """
     Simultaneously send encrypted HELLOs (carrying our DH public key) to
     the peer's public and local endpoints until one replies with theirs.
@@ -959,6 +991,7 @@ def punch_hole(sock, cipher, pub_addr, local_addr, dh_pub_bytes,
     status = "Punching through NAT..." if VERBOSE else "Connecting..."
     sys.stdout.write(f"  {status}")
     sys.stdout.flush()
+    hint_shown = False
 
     while time.time() - start < timeout:
         # Send a salvo to every target
@@ -1016,6 +1049,9 @@ def punch_hole(sock, cipher, pub_addr, local_addr, dh_pub_bytes,
             # is silently ignored; punch_hole only cares about HELLOs.
 
         elapsed = int(time.time() - start)
+        if hint and not hint_shown and elapsed >= DIRECT_HINT_AFTER:
+            hint_shown = True
+            sys.stdout.write("\n" + hint + "\n")
         if elapsed >= 60:
             sys.stdout.write(f"\r  {status} {elapsed // 60}m {elapsed % 60}s  ")
         else:
@@ -1027,6 +1063,285 @@ def punch_hole(sock, cipher, pub_addr, local_addr, dh_pub_bytes,
     else:
         print("\n  Connection timed out.")
     return None, None
+
+
+# ===============================================================================
+# Relay transport  (used only when both sides pass --relay)
+# ===============================================================================
+#
+# Design: RelaySocket is a drop-in stand-in for a UDP socket. It implements
+# exactly the subset of the socket API that punch_hole(), send_file_reliable(),
+# and recv_file_reliable() use -- sendto, recvfrom, fileno, settimeout,
+# setblocking, close -- so none of that code needs to know or care that
+# packets are travelling over HTTPS instead of raw UDP. In particular,
+# punch_hole() itself is reused completely unmodified: pass it a RelaySocket
+# and a single placeholder "peer address" instead of a real UDP socket and
+# real STUN-discovered addresses, and the exact same HELLO/DH exchange runs
+# over the relay.
+#
+# Internally: outgoing datagrams are queued and flushed to the relay in
+# small batches by a background thread (bounded by size or a short timer).
+# Incoming batches are long-polled from the relay by another background
+# thread and injected into a local loopback UDP socket -- which is what
+# recvfrom()/select() actually operate on, so RelaySocket stays select()-able
+# without reimplementing socket semantics from scratch.
+#
+# No retry/ordering logic lives here. The ARQ layer above already assumes
+# an unreliable channel (it was written for raw UDP) and will retransmit
+# on its own if a batch never arrives -- this stays a dumb pipe.
+
+
+def _relay_session_token(secret: bytes) -> str:
+    """
+    Both peers derive the same opaque session id from the shared secret
+    already embedded in the send/recv codes -- no extra exchange needed,
+    and the relay never sees the secret itself, only this derived token.
+    """
+    return _hmac.new(secret, b"p2p-relay-session-v1", hashlib.sha256).hexdigest()[:32]
+
+
+def _encode_relay_batch(packets) -> bytes:
+    out = struct.pack(">H", len(packets))
+    for p in packets:
+        out += struct.pack(">H", len(p)) + p
+    return out
+
+
+def _decode_relay_batch(body: bytes):
+    if len(body) < 2:
+        return []
+    (count,) = struct.unpack(">H", body[:2])
+    off = 2
+    packets = []
+    for _ in range(count):
+        if off + 2 > len(body):
+            break
+        (plen,) = struct.unpack(">H", body[off:off + 2])
+        off += 2
+        if off + plen > len(body):
+            break
+        packets.append(body[off:off + plen])
+        off += plen
+    return packets
+
+
+def _relay_backoff(retry_after):
+    """Seconds to wait after a 429/503. Honors the relay's Retry-After,
+    clamped to a sane range; defaults to 1s if the header is absent."""
+    if retry_after is None:
+        retry_after = 1.0
+    return max(RELAY_RETRY_SLEEP, min(retry_after, RELAY_BACKOFF_MAX))
+
+
+class _RelayConn:
+    """
+    One HTTPS connection to the relay, reused across requests when safe.
+    Each background loop owns its own instance (never shared across threads).
+
+    The connection is treated as disposable: on ANY failure it is closed and
+    the next request starts on a fresh one. Connections that are old or have
+    sat idle are dropped before use, because unstable networks (and NAT
+    boxes) silently kill idle TCP connections. If the very first request on
+    a reused connection fails, it is retried once on a fresh connection. A
+    duplicate request is harmless -- the ARQ layer already tolerates
+    duplicated and lost packets.
+    """
+
+    def __init__(self, host, timeout):
+        self._host = host
+        self._timeout = timeout
+        self._conn = None
+        self._born = 0.0
+        self._last_used = 0.0
+        self._count = 0
+
+    def close(self):
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except OSError:
+                pass
+            self._conn = None
+
+    @staticmethod
+    def _parse_retry_after(value):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def request(self, method, path, body=None):
+        """
+        Returns (status, body_bytes, retry_after_seconds_or_None).
+        Raises OSError / http.client.HTTPException on failure; the
+        connection has already been discarded when that happens.
+        """
+        now = time.time()
+        if not RELAY_REUSE_CONN:
+            self.close()
+        elif self._conn is not None and (
+            now - self._born > RELAY_CONN_MAX_AGE
+            or now - self._last_used > RELAY_CONN_MAX_IDLE
+            or self._count >= RELAY_CONN_MAX_REQS
+        ):
+            self.close()
+
+        for attempt in (0, 1):
+            reused = self._conn is not None
+            if not reused:
+                self._conn = http.client.HTTPSConnection(
+                    self._host, timeout=self._timeout)
+                self._born = time.time()
+                self._count = 0
+            try:
+                self._conn.request(method, path, body=body)
+                resp = self._conn.getresponse()
+                data = resp.read()
+            except (OSError, http.client.HTTPException) as e:
+                self.close()
+                # A reused connection may have been dropped while idle.
+                # Retry once on a fresh one -- but never after a timeout,
+                # which would just double an already long wait.
+                if (reused and attempt == 0
+                        and not isinstance(e, (socket.timeout, TimeoutError))):
+                    continue
+                raise
+            self._count += 1
+            self._last_used = time.time()
+            if resp.will_close or not RELAY_REUSE_CONN:
+                self.close()
+            return (resp.status, data,
+                    self._parse_retry_after(resp.getheader("Retry-After")))
+
+
+class RelaySocket:
+    """See module note above. PEER_ADDR is a fixed placeholder -- nothing
+    is ever actually routed to it; it exists only so punch_hole()'s
+    addr-equality filtering has a consistent value to compare against."""
+
+    PEER_ADDR = ("127.255.255.1", 1)
+
+    def __init__(self, host, token, send_dir, recv_dir):
+        self._host      = host
+        self._token     = token
+        self._send_dir  = send_dir
+        self._recv_dir  = recv_dir
+
+        # Loopback pair purely so recvfrom()/select() keep working exactly
+        # like they would on a real UDP socket -- nothing here is a network
+        # hop, it's just how incoming relay data gets surfaced through the
+        # normal recvfrom()/select() calls the rest of the code already uses.
+        self._inject = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._inject.bind(("127.0.0.1", 0))
+        self._local = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._local.bind(("127.0.0.1", 0))
+        self._local_addr = self._local.getsockname()
+
+        self._out_q = queue.Queue()
+        self._stop  = threading.Event()
+        self._send_thread = threading.Thread(target=self._send_loop, daemon=True)
+        self._recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
+        self._send_thread.start()
+        self._recv_thread.start()
+
+    # ---- socket-like interface used by punch_hole / *_reliable -------------
+
+    def sendto(self, data, _addr):
+        self._out_q.put(bytes(data))
+
+    def recvfrom(self, bufsize):
+        data, _ = self._local.recvfrom(bufsize)
+        return data, self.PEER_ADDR
+
+    def fileno(self):
+        return self._local.fileno()
+
+    def settimeout(self, t):
+        self._local.settimeout(t)
+
+    def setblocking(self, flag):
+        self._local.setblocking(flag)
+
+    def close(self):
+        self._stop.set()
+        for s in (self._inject, self._local):
+            try:
+                s.close()
+            except OSError:
+                pass
+
+    # ---- background transport ------------------------------------------
+
+    def _send_loop(self):
+        conn = _RelayConn(self._host, RELAY_SEND_TIMEOUT)
+        path = f"/relay/{self._token}/{self._send_dir}/send"
+        try:
+            while not self._stop.is_set():
+                try:
+                    batch = [self._out_q.get(timeout=RELAY_FLUSH_WAIT)]
+                except queue.Empty:
+                    continue
+                while len(batch) < WINDOW_SIZE:
+                    try:
+                        batch.append(self._out_q.get_nowait())
+                    except queue.Empty:
+                        break
+                body = _encode_relay_batch(batch)
+                try:
+                    status, _, retry_after = conn.request("POST", path, body)
+                except (OSError, http.client.HTTPException):
+                    # Equivalent to a dropped UDP packet -- the ARQ layer
+                    # above will notice the missing ACK/DATA and retransmit
+                    # on its own timers. Nothing to do here but move on.
+                    _vprint("  [relay] send batch failed, ARQ will retransmit")
+                    self._stop.wait(RELAY_RETRY_SLEEP)
+                    continue
+                if status == 200:
+                    continue
+                # The relay answered but did not accept the batch; ARQ will
+                # retransmit it. Back off so we don't hammer a relay that
+                # is rate-limiting or full.
+                if status in (429, 503):
+                    delay = _relay_backoff(retry_after)
+                    _vprint(f"  [relay] send throttled (HTTP {status}), "
+                            f"backing off {delay:.1f}s")
+                else:
+                    delay = RELAY_RETRY_SLEEP
+                    _vprint(f"  [relay] send rejected (HTTP {status})")
+                self._stop.wait(delay)
+        finally:
+            conn.close()
+
+    def _recv_loop(self):
+        conn = _RelayConn(self._host, RELAY_HTTP_TIMEOUT)
+        path = f"/relay/{self._token}/{self._recv_dir}/recv"
+        try:
+            while not self._stop.is_set():
+                try:
+                    status, body, retry_after = conn.request("GET", path)
+                except (OSError, http.client.HTTPException):
+                    self._stop.wait(RELAY_RETRY_SLEEP)
+                    continue
+                if status != 200:
+                    # Error bodies are plain text, not batches: never feed
+                    # them to the decoder. Back off before polling again so
+                    # a throttled client doesn't spin.
+                    if status in (429, 503):
+                        delay = _relay_backoff(retry_after)
+                        _vprint(f"  [relay] recv throttled (HTTP {status}), "
+                                f"backing off {delay:.1f}s")
+                    else:
+                        delay = RELAY_RETRY_SLEEP
+                        _vprint(f"  [relay] recv rejected (HTTP {status})")
+                    self._stop.wait(delay)
+                    continue
+                for pkt in _decode_relay_batch(body):
+                    try:
+                        self._inject.sendto(pkt, self._local_addr)
+                    except OSError:
+                        pass
+        finally:
+            conn.close()
 
 
 # ===============================================================================
@@ -1799,6 +2114,22 @@ BANNER = r"""
 """
 
 
+def _relay_reachable():
+    """Quick check that the relay answers, so --relay fails fast with a clear
+    message instead of waiting out the (very long) connect timeout."""
+    try:
+        c = http.client.HTTPSConnection(RELAY_HOST, timeout=8)
+        try:
+            c.request("GET", "/healthz")
+            r = c.getresponse()
+            r.read()
+            return r.status == 200
+        finally:
+            c.close()
+    except (OSError, http.client.HTTPException):
+        return False
+
+
 def cmd_send(filepath, connect_timeout=CONNECT_TIMEOUT):
     # ---- Pre-flight checks --------------------------------------------------
     if not os.path.isfile(filepath):
@@ -1849,8 +2180,12 @@ def cmd_send(filepath, connect_timeout=CONNECT_TIMEOUT):
     local_ip   = get_local_ip()
 
     # ---- STUN ---------------------------------------------------------------
-    _vprint("  Discovering public endpoint via STUN...")
-    pub = stun_discover(sock)
+    if USE_RELAY:
+        _vprint("  Relay mode: skipping STUN and hole punching.")
+        pub = None
+    else:
+        _vprint("  Discovering public endpoint via STUN...")
+        pub = stun_discover(sock)
     if pub:
         pub_ip, pub_port = pub
         try:
@@ -1864,12 +2199,14 @@ def cmd_send(filepath, connect_timeout=CONNECT_TIMEOUT):
             _vprint("  STUN returned wrong-family address -- using local address.")
     else:
         pub_ip, pub_port = local_ip, local_port
-        if USE_IPV6:
+        if USE_RELAY:
+            pass   # addresses in the codes are unused in relay mode
+        elif USE_IPV6:
             _vprint("  STUN failed -- using local IPv6 address (IPv6 has no NAT).")
         else:
             _vprint("  STUN failed -- using local address (LAN-only transfer).")
     _vprint(f"  Local  : {_fmt_addr(local_ip, local_port)}")
-    if _is_cgnat(pub_ip):
+    if not USE_RELAY and _is_cgnat(pub_ip):
         print(_CGNAT_WARNING.format(ip=pub_ip))
     secret = secrets.token_bytes(16)
     salt   = secrets.token_bytes(16)
@@ -1927,35 +2264,65 @@ def cmd_send(filepath, connect_timeout=CONNECT_TIMEOUT):
     handshake_cipher = Cipher(secret, salt, is_sender=True)
     dh_priv, dh_pub  = _dh_keypair()
 
-    try:
-        peer, peer_dh_pub = punch_hole(
-            sock,
-            handshake_cipher,
-            (peer_pub_ip, peer_pub_port),
-            (peer_local_ip, peer_local_port),
-            dh_pub,
-            timeout=connect_timeout,
-        )
-    except KeyboardInterrupt:
-        print("\n  Cancelled during connection.")
-        sock.close()
-        sys.exit(0)
+    relay_sock = None
+    if USE_RELAY:
+        # Relay mode: no hole punching at all -- both sides meet at the relay.
+        print("  Relay mode: connecting through the relay (receiver must also use --relay).")
+        token = _relay_session_token(secret)
+        relay_sock = RelaySocket(RELAY_HOST, token, send_dir="s2r", recv_dir="r2s")
+        try:
+            peer, peer_dh_pub = punch_hole(
+                relay_sock, handshake_cipher,
+                RelaySocket.PEER_ADDR, RelaySocket.PEER_ADDR,
+                dh_pub, timeout=connect_timeout,
+            )
+        except KeyboardInterrupt:
+            print("\n  Cancelled during connection.")
+            relay_sock.close()
+            sock.close()
+            sys.exit(0)
 
-    if not peer:
-        print("  Could not reach the receiver.")
-        print("  Possible causes:")
-        print("    - The receiver is not running 'recv' right now")
-        print("    - The recv code is from a different session (try again from the start)")
-        print("    - One or both sides are behind CG-NAT or symmetric NAT")
-        print("    - A firewall is blocking direct peer-to-peer UDP")
-        print("  CG-NAT and symmetric NAT require a relay -- this tool does not provide one.")
-        sock.close()
-        sys.exit(1)
+        if not peer:
+            print("  Could not reach the receiver through the relay.")
+            print("  Possible causes:")
+            print("    - The receiver is not running 'recv --relay' right now")
+            print("    - The recv code is from a different session (try again from the start)")
+            print("    - The relay server became unreachable")
+            relay_sock.close()
+            sock.close()
+            sys.exit(1)
+    else:
+        try:
+            peer, peer_dh_pub = punch_hole(
+                sock,
+                handshake_cipher,
+                (peer_pub_ip, peer_pub_port),
+                (peer_local_ip, peer_local_port),
+                dh_pub,
+                timeout=connect_timeout,
+                hint=_DIRECT_HINT,
+            )
+        except KeyboardInterrupt:
+            print("\n  Cancelled during connection.")
+            sock.close()
+            sys.exit(0)
+
+        if not peer:
+            print("  Could not reach the receiver.")
+            print("  Possible causes:")
+            print("    - The receiver is not running 'recv' right now")
+            print("    - The recv code is from a different session (try again from the start)")
+            print("    - One or both sides are behind CG-NAT or symmetric NAT")
+            print("  If direct connection keeps failing, run both sides with --relay.")
+            sock.close()
+            sys.exit(1)
 
     try:
         dh_shared = _dh_shared_secret(dh_priv, peer_dh_pub)
     except ValueError as e:
         print(f"  Handshake error: {e}")
+        if relay_sock:
+            relay_sock.close()
         sock.close()
         sys.exit(1)
 
@@ -1963,10 +2330,13 @@ def cmd_send(filepath, connect_timeout=CONNECT_TIMEOUT):
     session_cipher = Cipher(secret + dh_shared, salt, is_sender=True)
 
     # ---- Transfer -----------------------------------------------------------
+    xfer_sock = relay_sock if relay_sock else sock
     ok = send_file_reliable(
-        sock, peer, session_cipher, filepath, filesize, filehash,
+        xfer_sock, peer, session_cipher, filepath, filesize, filehash,
         connect_timeout=connect_timeout,
     )
+    if relay_sock:
+        relay_sock.close()
     sock.close()
 
     if ok:
@@ -1997,8 +2367,12 @@ def cmd_recv(connect_timeout=CONNECT_TIMEOUT, max_size=MAX_FILE_SIZE, resume_pat
     local_ip   = get_local_ip()
 
     # ---- STUN ---------------------------------------------------------------
-    _vprint("  Discovering public endpoint via STUN...")
-    pub = stun_discover(sock)
+    if USE_RELAY:
+        _vprint("  Relay mode: skipping STUN and hole punching.")
+        pub = None
+    else:
+        _vprint("  Discovering public endpoint via STUN...")
+        pub = stun_discover(sock)
     if pub:
         pub_ip, pub_port = pub
         try:
@@ -2012,12 +2386,14 @@ def cmd_recv(connect_timeout=CONNECT_TIMEOUT, max_size=MAX_FILE_SIZE, resume_pat
             _vprint("  STUN returned wrong-family address -- using local address.")
     else:
         pub_ip, pub_port = local_ip, local_port
-        if USE_IPV6:
+        if USE_RELAY:
+            pass   # addresses in the codes are unused in relay mode
+        elif USE_IPV6:
             _vprint("  STUN failed -- using local IPv6 address (IPv6 has no NAT).")
         else:
             _vprint("  STUN failed -- using local address (LAN-only transfer).")
     _vprint(f"  Local  : {_fmt_addr(local_ip, local_port)}")
-    if _is_cgnat(pub_ip):
+    if not USE_RELAY and _is_cgnat(pub_ip):
         print(_CGNAT_WARNING.format(ip=pub_ip))
 
     # ---- Get sender code ----------------------------------------------------
@@ -2071,35 +2447,65 @@ def cmd_recv(connect_timeout=CONNECT_TIMEOUT, max_size=MAX_FILE_SIZE, resume_pat
     handshake_cipher = Cipher(secret, salt, is_sender=False)
     dh_priv, dh_pub  = _dh_keypair()
 
-    try:
-        peer, peer_dh_pub = punch_hole(
-            sock,
-            handshake_cipher,
-            (peer_pub_ip, peer_pub_port),
-            (peer_local_ip, peer_local_port),
-            dh_pub,
-            timeout=connect_timeout,
-        )
-    except KeyboardInterrupt:
-        print("\n  Cancelled during connection.")
-        sock.close()
-        sys.exit(0)
+    relay_sock = None
+    if USE_RELAY:
+        # Relay mode: no hole punching at all -- both sides meet at the relay.
+        print("  Relay mode: connecting through the relay (sender must also use --relay).")
+        token = _relay_session_token(secret)
+        relay_sock = RelaySocket(RELAY_HOST, token, send_dir="r2s", recv_dir="s2r")
+        try:
+            peer, peer_dh_pub = punch_hole(
+                relay_sock, handshake_cipher,
+                RelaySocket.PEER_ADDR, RelaySocket.PEER_ADDR,
+                dh_pub, timeout=connect_timeout,
+            )
+        except KeyboardInterrupt:
+            print("\n  Cancelled during connection.")
+            relay_sock.close()
+            sock.close()
+            sys.exit(0)
 
-    if not peer:
-        print("  Could not reach the sender.")
-        print("  Possible causes:")
-        print("    - The sender has not yet pasted your recv code")
-        print("    - The send code you used is from a different session")
-        print("    - One or both sides are behind CG-NAT or symmetric NAT")
-        print("    - A firewall is blocking direct peer-to-peer UDP")
-        print("  CG-NAT and symmetric NAT require a relay -- this tool does not provide one.")
-        sock.close()
-        sys.exit(1)
+        if not peer:
+            print("  Could not reach the sender through the relay.")
+            print("  Possible causes:")
+            print("    - The sender has not yet pasted your recv code")
+            print("    - The send code you used is from a different session")
+            print("    - The relay server became unreachable")
+            relay_sock.close()
+            sock.close()
+            sys.exit(1)
+    else:
+        try:
+            peer, peer_dh_pub = punch_hole(
+                sock,
+                handshake_cipher,
+                (peer_pub_ip, peer_pub_port),
+                (peer_local_ip, peer_local_port),
+                dh_pub,
+                timeout=connect_timeout,
+                hint=_DIRECT_HINT,
+            )
+        except KeyboardInterrupt:
+            print("\n  Cancelled during connection.")
+            sock.close()
+            sys.exit(0)
+
+        if not peer:
+            print("  Could not reach the sender.")
+            print("  Possible causes:")
+            print("    - The sender has not yet pasted your recv code")
+            print("    - The send code you used is from a different session")
+            print("    - One or both sides are behind CG-NAT or symmetric NAT")
+            print("  If direct connection keeps failing, run both sides with --relay.")
+            sock.close()
+            sys.exit(1)
 
     try:
         dh_shared = _dh_shared_secret(dh_priv, peer_dh_pub)
     except ValueError as e:
         print(f"  Handshake error: {e}")
+        if relay_sock:
+            relay_sock.close()
         sock.close()
         sys.exit(1)
 
@@ -2107,10 +2513,13 @@ def cmd_recv(connect_timeout=CONNECT_TIMEOUT, max_size=MAX_FILE_SIZE, resume_pat
     session_cipher = Cipher(secret + dh_shared, salt, is_sender=False)
 
     # ---- Receive ------------------------------------------------------------
+    xfer_sock = relay_sock if relay_sock else sock
     result = recv_file_reliable(
-        sock, peer, session_cipher, connect_timeout=connect_timeout,
+        xfer_sock, peer, session_cipher, connect_timeout=connect_timeout,
         max_size=max_size, resume_path=resume_path
     )
+    if relay_sock:
+        relay_sock.close()
     sock.close()
 
     if result is None:
@@ -2155,12 +2564,13 @@ def cmd_recv(connect_timeout=CONNECT_TIMEOUT, max_size=MAX_FILE_SIZE, resume_pat
 
 
 def main():
+    global RELAY_HOST
     print(BANNER)
 
     if len(sys.argv) < 2 or "-h" in sys.argv[1:] or "--help" in sys.argv[1:]:
         print("  Usage:")
-        print("    python p2p.py send <file> [-6] [--connect-timeout SECONDS] [--verbose]")
-        print("    python p2p.py recv        [-6] [--connect-timeout SECONDS] [--resume PARTIAL_FILE] [--verbose]")
+        print("    python p2p.py send <file> [-6] [--relay] [--connect-timeout SECONDS] [--verbose]")
+        print("    python p2p.py recv        [-6] [--relay] [--connect-timeout SECONDS] [--resume PARTIAL_FILE] [--verbose]")
         print()
         print("  -6                 Use IPv6 (both sides must agree). Bypasses NAT")
         print("                     entirely -- works wherever IPv6 is available.")
@@ -2171,6 +2581,10 @@ def main():
         print("                     how much was received correctly and resume from there.")
         print("  --verbose          Show technical connection details such as IP")
         print("                     addresses, STUN status, and handshake status.")
+        print("  --relay            Connect through the HTTPS relay instead of direct")
+        print("                     hole punching. BOTH sides must use it. Without")
+        print("                     this flag the relay is never contacted.")
+        print(f"  --relay-host HOST  Override the relay server (default: {RELAY_HOST}).")
         sys.exit(0)
 
     # Parse optional flags
@@ -2179,6 +2593,8 @@ def main():
     resume_path     = None
     verbose         = False
     use_ipv6        = False
+    use_relay       = False
+    old_no_relay    = False
     filtered        = []
     i = 0
     while i < len(args):
@@ -2200,19 +2616,40 @@ def main():
         elif args[i] in ("-6", "--ipv6"):
             use_ipv6 = True
             i += 1
+        elif args[i] == "--relay":
+            use_relay = True
+            i += 1
+        elif args[i] == "--no-relay":   # old flag: direct-only is now the default
+            old_no_relay = True
+            i += 1
+        elif args[i] == "--relay-host" and i + 1 < len(args):
+            RELAY_HOST = args[i + 1]
+            i += 2
         else:
             filtered.append(args[i])
             i += 1
     args = filtered
-    global VERBOSE, USE_IPV6
-    VERBOSE  = verbose
-    USE_IPV6 = use_ipv6
+    global VERBOSE, USE_IPV6, USE_RELAY
+    VERBOSE        = verbose
+    USE_IPV6       = use_ipv6
+    USE_RELAY      = use_relay
+    if old_no_relay:
+        print("  Note: --no-relay is no longer needed; the relay is only used with --relay.")
+    if use_relay and old_no_relay:
+        print("  Error: --relay and --no-relay cannot be used together.")
+        sys.exit(1)
 
     if not args:
         print("  Use 'send' or 'recv'.  Run with -h for help.")
         sys.exit(1)
 
     cmd = args[0].lower()
+
+    if USE_RELAY and cmd in ("send", "recv", "receive"):
+        if not _relay_reachable():
+            print(f"  Error: cannot reach the relay at {RELAY_HOST}.")
+            print("  Check your internet connection, or point at another relay with --relay-host.")
+            sys.exit(1)
 
     try:
         if cmd == "send":

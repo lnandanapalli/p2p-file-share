@@ -76,6 +76,17 @@ python p2p.py recv --resume "./tmpabcd1234" --connect-timeout 7200
 
 The `--connect-timeout` parameter (in seconds) controls how long both sides wait during the hole-punch and initial handshake. The file transfer itself has no time limit (only packet-loss retries apply).
 
+**Relay mode (`--relay`):**
+
+If direct hole punching can't work on your network (CG-NAT, symmetric NAT on both sides, nested VMs, strict firewalls), run **both** sides with `--relay`:
+
+```
+python p2p.py send photo.jpg --relay
+python p2p.py recv --relay
+```
+
+With `--relay` the tool skips STUN and hole punching entirely and sends the same encrypted packets through an HTTPS relay (see `relay/`). The relay only moves encrypted bytes; it can't read your file. Both sides must use the flag, so agree on it over whatever channel you use to swap codes. **Without `--relay`, the relay is never contacted.** If a direct connection is still failing after 30 seconds, the tool prints a reminder about this option. Use `--relay-host HOST` to point at your own relay instead of the default.
+
 The file saves to the current directory.
 
 ## How it works
@@ -99,9 +110,9 @@ Works behind most consumer NATs (IPv4):
 - **Full-cone** -- works
 - **Address-restricted** -- works
 - **Port-restricted** -- works
-- **Symmetric** -- will likely fail (both sides behind symmetric NAT is the hard case; no relay server exists to fall back on). Use `-6` if both sides have IPv6 -- it bypasses NAT entirely.
+- **Symmetric** -- will likely fail (both sides behind symmetric NAT is the hard case). Use `-6` if both sides have IPv6 -- it bypasses NAT entirely -- or run both sides with `--relay`.
 
-**CG-NAT detection:** At startup, the script checks whether STUN reports a private or CG-NAT address (RFC 1918 ranges and RFC 6598 `100.64.0.0/10`). If detected, a warning is printed before attempting the connection. CG-NAT means your ISP is sharing one public IP across many customers; direct UDP hole-punching cannot reach your machine in that configuration, and this tool has no relay fallback. This check only applies to IPv4; IPv6 has no CG-NAT equivalent.
+**CG-NAT detection:** At startup, the script checks whether STUN reports a private or CG-NAT address (RFC 1918 ranges and RFC 6598 `100.64.0.0/10`). If detected, a warning is printed before attempting the connection. CG-NAT means your ISP is sharing one public IP across many customers; direct UDP hole-punching cannot reach your machine in that configuration; run both sides with `--relay` instead. This check only applies to IPv4; IPv6 has no CG-NAT equivalent.
 
 With **IPv6** (`-6`): NAT does not exist, so all of the above cases are irrelevant. The only requirement is that both peers have a globally routable IPv6 address and that their firewall allows inbound UDP.
 
@@ -152,7 +163,7 @@ No `pip install`. No virtualenv. Just the one file.
 
 ## Limitations
 
-- **No relay fallback.** If hole punching fails (symmetric NAT on both sides, CG-NAT, aggressive firewall), there is no TURN server to fall through to. The connection fails. Use `-6` if both sides have IPv6 -- it sidesteps NAT entirely.
+- **The relay is opt-in, not automatic.** If hole punching fails (symmetric NAT on both sides, CG-NAT, aggressive firewall), the connection fails; it does not switch to the relay on its own. Re-run both sides with `--relay`, or use `-6` if both sides have IPv6 -- it sidesteps NAT entirely.
 - **Single file only.** To send a directory, tar/zip it first.
 - **Manual resume only.** If the transfer drops, restart `recv` with the `--resume` command printed by the previous attempt. Resume depends on keeping the preserved partial/temp file.
 - **Non-standard crypto.** The stream cipher is homebrew. It's built from solid primitives (SHA-256, HMAC, PBKDF2, DH) but the composition hasn't been formally analyzed. See the warning above.

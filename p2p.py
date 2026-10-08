@@ -28,6 +28,10 @@ Flow:
     7. Receiver sees file name and size, then accepts or declines.
     8. If accepted, the encrypted transfer begins.
 
+  With --relay (both sides) the flow is shorter: the sender gets one short
+  code (13 words), shares it, and waits at the relay; the receiver pastes it
+  and connects. There is no recv code and no hole punching.
+
 Crypto:
     - 128-bit random secret (embedded in the send code)
     - PBKDF2-HMAC-SHA256 key derivation (random salt) -> separate keys per direction
@@ -1089,6 +1093,27 @@ def punch_hole(sock, cipher, pub_addr, local_addr, dh_pub_bytes,
 # No retry/ordering logic lives here. The ARQ layer above already assumes
 # an unreliable channel (it was written for raw UDP) and will retransmit
 # on its own if a batch never arrives -- this stays a dumb pipe.
+
+
+# Relay mode uses a single short code: just the 128-bit secret (13 words).
+# No addresses are needed (nobody punches anything), and the PBKDF2 salt is
+# derived from the secret instead of being sent. Direct-mode sender codes are
+# 36 or 55 words, so the two code types can never be confused.
+RELAY_CODE_WORDS = 13
+
+
+def _relay_salt(secret: bytes) -> bytes:
+    return _hmac.new(secret, b"p2p-relay-salt-v1", hashlib.sha256).digest()[:16]
+
+
+def encode_relay_code(secret: bytes) -> str:
+    """128-bit secret -> 13 words."""
+    return _bytes_to_words(secret)
+
+
+def decode_relay_code(code: str) -> bytes:
+    """13 words -> 128-bit secret. Raises ValueError on bad input."""
+    return _words_to_bytes(code, 16)
 
 
 def _relay_session_token(secret: bytes) -> str:
@@ -2209,8 +2234,12 @@ def cmd_send(filepath, connect_timeout=CONNECT_TIMEOUT):
     if not USE_RELAY and _is_cgnat(pub_ip):
         print(_CGNAT_WARNING.format(ip=pub_ip))
     secret = secrets.token_bytes(16)
-    salt   = secrets.token_bytes(16)
-    code   = encode_sender_code(secret, salt, pub_ip, pub_port, local_ip, local_port)
+    if USE_RELAY:
+        salt = _relay_salt(secret)
+        code = encode_relay_code(secret)
+    else:
+        salt = secrets.token_bytes(16)
+        code = encode_sender_code(secret, salt, pub_ip, pub_port, local_ip, local_port)
 
     print()
     print("  +==========================================================+")
@@ -2220,44 +2249,49 @@ def cmd_send(filepath, connect_timeout=CONNECT_TIMEOUT):
     print(f"  {code}")
     print()
 
-    # ---- Wait for receiver's code -------------------------------------------
-    try:
-        rcode = input("  Paste receiver's code: ").strip()
-    except (KeyboardInterrupt, EOFError):
-        print("\n  Cancelled.")
-        sock.close()
-        sys.exit(0)
+    if USE_RELAY:
+        # Relay mode: there is no receiver code. We are already holding the
+        # secret, so go straight to the relay and wait for the receiver there.
+        print("  Relay mode: nothing to paste back. The receiver needs only the code above.")
+    else:
+        # ---- Wait for receiver's code -------------------------------------------
+        try:
+            rcode = input("  Paste receiver's code: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\n  Cancelled.")
+            sock.close()
+            sys.exit(0)
 
-    if not rcode:
-        print("  No code entered.")
-        sock.close()
-        sys.exit(1)
+        if not rcode:
+            print("  No code entered.")
+            sock.close()
+            sys.exit(1)
 
-    # Detect IPv4/IPv6 mismatch before decoding
-    _rwords = rcode.strip().lower().split()
-    _expected_rwords = 42 if USE_IPV6 else 23
-    if len(_rwords) != _expected_rwords:
-        print("  Error: invalid receiver code.")
-        if not USE_IPV6 and len(_rwords) == 42:
-            print("  The receiver is using IPv6 (-6). Re-run: python p2p.py send <file> -6")
-        elif USE_IPV6 and len(_rwords) == 23:
-            print("  The receiver is using IPv4. Both sides must agree on -6 (or neither).")
-        else:
-            print("  Make sure you copied the entire RECV CODE from the receiver's screen.")
-        sock.close()
-        sys.exit(1)
+        # Detect IPv4/IPv6 mismatch before decoding
+        _rwords = rcode.strip().lower().split()
+        _expected_rwords = 42 if USE_IPV6 else 23
+        if len(_rwords) != _expected_rwords:
+            print("  Error: invalid receiver code.")
+            if not USE_IPV6 and len(_rwords) == 42:
+                print("  The receiver is using IPv6 (-6). Re-run: python p2p.py send <file> -6")
+            elif USE_IPV6 and len(_rwords) == 23:
+                print("  The receiver is using IPv4. Both sides must agree on -6 (or neither).")
+            else:
+                print("  Make sure you copied the entire RECV CODE from the receiver's screen.")
+            sock.close()
+            sys.exit(1)
 
-    result = decode_recv_code(rcode, secret)
-    if result is None:
-        print("  Error: invalid receiver code.")
-        print("  Make sure you copied the entire RECV CODE from the receiver's screen,")
-        print("  and that the receiver used the SEND CODE you gave them (not an old one).")
-        sock.close()
-        sys.exit(1)
+        result = decode_recv_code(rcode, secret)
+        if result is None:
+            print("  Error: invalid receiver code.")
+            print("  Make sure you copied the entire RECV CODE from the receiver's screen,")
+            print("  and that the receiver used the SEND CODE you gave them (not an old one).")
+            sock.close()
+            sys.exit(1)
 
-    peer_pub_ip, peer_pub_port, peer_local_ip, peer_local_port = result
-    _vprint(f"  Peer public : {_fmt_addr(peer_pub_ip, peer_pub_port)}")
-    _vprint(f"  Peer local  : {_fmt_addr(peer_local_ip, peer_local_port)}")
+        peer_pub_ip, peer_pub_port, peer_local_ip, peer_local_port = result
+        _vprint(f"  Peer public : {_fmt_addr(peer_pub_ip, peer_pub_port)}")
+        _vprint(f"  Peer local  : {_fmt_addr(peer_local_ip, peer_local_port)}")
 
     # ---- Handshake ----------------------------------------------------------
     _vprint("  Deriving handshake keys (PBKDF2, 100k rounds)...")
@@ -2286,7 +2320,7 @@ def cmd_send(filepath, connect_timeout=CONNECT_TIMEOUT):
             print("  Could not reach the receiver through the relay.")
             print("  Possible causes:")
             print("    - The receiver is not running 'recv --relay' right now")
-            print("    - The recv code is from a different session (try again from the start)")
+            print("    - The receiver pasted a different (old) send code")
             print("    - The relay server became unreachable")
             relay_sock.close()
             sock.close()
@@ -2410,37 +2444,60 @@ def cmd_recv(connect_timeout=CONNECT_TIMEOUT, max_size=MAX_FILE_SIZE, resume_pat
         sock.close()
         sys.exit(1)
 
-    try:
-        secret, salt, peer_pub_ip, peer_pub_port, peer_local_ip, peer_local_port, code_ipv6 = (
-            decode_sender_code(scode)
-        )
-    except Exception:
-        print("  Error: invalid sender code.")
-        print("  Make sure you copied the entire SEND CODE from the sender's screen.")
-        sock.close()
-        sys.exit(1)
+    _nwords = len(scode.split())
+    if USE_RELAY:
+        if _nwords in (36, 55):
+            print("  Error: this is a direct-mode code (the sender did not use --relay).")
+            print("  Both sides must use --relay, or neither.")
+            sock.close()
+            sys.exit(1)
+        try:
+            secret = decode_relay_code(scode)
+        except Exception:
+            print("  Error: invalid sender code.")
+            print(f"  A relay code is {RELAY_CODE_WORDS} words. Make sure you copied the whole SEND CODE.")
+            sock.close()
+            sys.exit(1)
+        salt = _relay_salt(secret)
+        print()
+        print("  Relay mode: nothing to send back. You only need the sender's code.")
+    else:
+        if _nwords == RELAY_CODE_WORDS:
+            print("  Error: this is a relay code (the sender used --relay).")
+            print("  Both sides must use --relay, or neither. Re-run: python p2p.py recv --relay")
+            sock.close()
+            sys.exit(1)
+        try:
+            secret, salt, peer_pub_ip, peer_pub_port, peer_local_ip, peer_local_port, code_ipv6 = (
+                decode_sender_code(scode)
+            )
+        except Exception:
+            print("  Error: invalid sender code.")
+            print("  Make sure you copied the entire SEND CODE from the sender's screen.")
+            sock.close()
+            sys.exit(1)
 
-    if code_ipv6 != USE_IPV6:
-        print("  Error: address-family mismatch.")
-        if code_ipv6:
-            print("  The sender is using IPv6 (-6). Re-run: python p2p.py recv -6")
-        else:
-            print("  The sender is using IPv4. Both sides must agree on -6 (or neither).")
-        sock.close()
-        sys.exit(1)
+        if code_ipv6 != USE_IPV6:
+            print("  Error: address-family mismatch.")
+            if code_ipv6:
+                print("  The sender is using IPv6 (-6). Re-run: python p2p.py recv -6")
+            else:
+                print("  The sender is using IPv4. Both sides must agree on -6 (or neither).")
+            sock.close()
+            sys.exit(1)
 
-    _vprint(f"  Peer public : {_fmt_addr(peer_pub_ip, peer_pub_port)}")
-    _vprint(f"  Peer local  : {_fmt_addr(peer_local_ip, peer_local_port)}")
+        _vprint(f"  Peer public : {_fmt_addr(peer_pub_ip, peer_pub_port)}")
+        _vprint(f"  Peer local  : {_fmt_addr(peer_local_ip, peer_local_port)}")
 
-    # ---- Display RECV CODE --------------------------------------------------
-    rcode = encode_recv_code(pub_ip, pub_port, local_ip, local_port, secret)
-    print()
-    print("  +==========================================================+")
-    print("  |  RECV CODE -- give this back to the sender:              |")
-    print("  +==========================================================+")
-    print()
-    print(f"  {rcode}")
-    print()
+        # ---- Display RECV CODE --------------------------------------------------
+        rcode = encode_recv_code(pub_ip, pub_port, local_ip, local_port, secret)
+        print()
+        print("  +==========================================================+")
+        print("  |  RECV CODE -- give this back to the sender:              |")
+        print("  +==========================================================+")
+        print()
+        print(f"  {rcode}")
+        print()
 
     # ---- Handshake ----------------------------------------------------------
     _vprint("  Deriving handshake keys (PBKDF2, 100k rounds)...")
@@ -2468,8 +2525,8 @@ def cmd_recv(connect_timeout=CONNECT_TIMEOUT, max_size=MAX_FILE_SIZE, resume_pat
         if not peer:
             print("  Could not reach the sender through the relay.")
             print("  Possible causes:")
-            print("    - The sender has not yet pasted your recv code")
-            print("    - The send code you used is from a different session")
+            print("    - The sender is not running 'send --relay' right now")
+            print("    - The send code you used is from a different (old) session")
             print("    - The relay server became unreachable")
             relay_sock.close()
             sock.close()
@@ -2582,8 +2639,9 @@ def main():
         print("  --verbose          Show technical connection details such as IP")
         print("                     addresses, STUN status, and handshake status.")
         print("  --relay            Connect through the HTTPS relay instead of direct")
-        print("                     hole punching. BOTH sides must use it. Without")
-        print("                     this flag the relay is never contacted.")
+        print("                     hole punching. BOTH sides must use it. Uses one")
+        print("                     short code (13 words) from the sender only.")
+        print("                     Without this flag the relay is never contacted.")
         print(f"  --relay-host HOST  Override the relay server (default: {RELAY_HOST}).")
         sys.exit(0)
 

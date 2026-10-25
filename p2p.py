@@ -94,6 +94,11 @@ RELAY_CHUNK_SIZE  = 32 * 1024   # must stay < 65 KB (2-byte length in batch form
 RELAY_WINDOW_SIZE = 96          # ~3 MB in flight per round trip
 RELAY_ACK_TIMEOUT = 15.0        # big batches on a slow uplink take seconds; TCP doesn't drop
 RELAY_BATCH_BYTES = 2 * 1024 * 1024   # cap per POST (relay rejects > 4 MiB)
+# Request pacing: the relay allows ~50 requests/s per IP. 1/0.06 + 1/0.04
+# = ~42/s worst case per peer, so we stay under it instead of eating 429s.
+RELAY_MIN_POST_GAP = 0.06
+RELAY_MIN_GET_GAP  = 0.04
+RELAY_CLOSE_FLUSH  = 2.0     # seconds close() waits for queued packets to go out
 MAX_RETRIES = 200   # per-packet retransmit limit
 CONNECT_TIMEOUT = 3600   # seconds for all connection-phase waits
 PUNCH_INTERVAL = 0.25    # seconds between HELLO salvos
@@ -1287,6 +1292,7 @@ class RelaySocket:
 
         self._out_q = queue.Queue()
         self._stop  = threading.Event()
+        self._closing = False
         self._send_thread = threading.Thread(target=self._send_loop, daemon=True)
         self._recv_thread = threading.Thread(target=self._recv_loop, daemon=True)
         self._send_thread.start()
@@ -1314,6 +1320,10 @@ class RelaySocket:
         self._local.setblocking(flag)
 
     def close(self):
+        # Flush what's still queued (e.g. the final DONEACK) before stopping,
+        # or the peer waits out its whole DONE timeout.
+        self._closing = True
+        self._send_thread.join(timeout=RELAY_CLOSE_FLUSH)
         self._stop.set()
         for s in (self._bell, self._local):
             try:
@@ -1327,12 +1337,20 @@ class RelaySocket:
         conn = _RelayConn(self._host, RELAY_SEND_TIMEOUT)
         path = f"/relay/{self._token}/{self._send_dir}/send"
         try:
+            last_post = 0.0
             while not self._stop.is_set():
                 try:
-                    batch = [self._out_q.get(timeout=RELAY_FLUSH_WAIT)]
+                    first = self._out_q.get(timeout=RELAY_FLUSH_WAIT)
                 except queue.Empty:
+                    if self._closing:
+                        break       # everything flushed
                     continue
-                nbytes = len(batch[0])
+                # Pace POSTs so a peer stays under the relay's per-IP rate
+                # limit; packets queued during the pause join this batch.
+                gap = RELAY_MIN_POST_GAP - (time.time() - last_post)
+                if gap > 0:
+                    self._stop.wait(gap)
+                batch, nbytes = [first], len(first)
                 while len(batch) < WINDOW_SIZE and nbytes < RELAY_BATCH_BYTES:
                     try:
                         pkt = self._out_q.get_nowait()
@@ -1341,28 +1359,29 @@ class RelaySocket:
                     batch.append(pkt)
                     nbytes += len(pkt)
                 body = _encode_relay_batch(batch)
-                try:
-                    status, _, retry_after = conn.request("POST", path, body)
-                except (OSError, http.client.HTTPException):
-                    # Equivalent to a dropped UDP packet -- the ARQ layer
-                    # above will notice the missing ACK/DATA and retransmit
-                    # on its own timers. Nothing to do here but move on.
-                    _vprint("  [relay] send batch failed, ARQ will retransmit")
-                    self._stop.wait(RELAY_RETRY_SLEEP)
-                    continue
-                if status == 200:
-                    continue
-                # The relay answered but did not accept the batch; ARQ will
-                # retransmit it. Back off so we don't hammer a relay that
-                # is rate-limiting or full.
-                if status in (429, 503):
-                    delay = _relay_backoff(retry_after)
-                    _vprint(f"  [relay] send throttled (HTTP {status}), "
-                            f"backing off {delay:.1f}s")
-                else:
-                    delay = RELAY_RETRY_SLEEP
+                # Retry THIS batch on throttling / network errors instead of
+                # dropping it: a drop costs a full ACK timeout in the ARQ layer.
+                while not self._stop.is_set():
+                    last_post = time.time()
+                    try:
+                        status, _, retry_after = conn.request("POST", path, body)
+                    except (OSError, http.client.HTTPException):
+                        _vprint("  [relay] send batch failed, retrying")
+                        self._stop.wait(RELAY_RETRY_SLEEP)
+                        continue
+                    if status == 200:
+                        break
+                    if status in (429, 503):
+                        delay = _relay_backoff(retry_after)
+                        _vprint(f"  [relay] send throttled (HTTP {status}), "
+                                f"backing off {delay:.1f}s")
+                        self._stop.wait(delay)
+                        continue
+                    # Anything else (400/413...) won't succeed on retry; drop
+                    # it and let the ARQ layer resend.
                     _vprint(f"  [relay] send rejected (HTTP {status})")
-                self._stop.wait(delay)
+                    self._stop.wait(RELAY_RETRY_SLEEP)
+                    break
         finally:
             conn.close()
 
@@ -1370,7 +1389,12 @@ class RelaySocket:
         conn = _RelayConn(self._host, RELAY_HTTP_TIMEOUT)
         path = f"/relay/{self._token}/{self._recv_dir}/recv"
         try:
+            last_get = 0.0
             while not self._stop.is_set():
+                gap = RELAY_MIN_GET_GAP - (time.time() - last_get)
+                if gap > 0:
+                    self._stop.wait(gap)
+                last_get = time.time()
                 try:
                     status, body, retry_after = conn.request("GET", path)
                 except (OSError, http.client.HTTPException):
@@ -2001,9 +2025,9 @@ def _fmt(n):
 
 def _partial_saved_msg(working_path):
     """Print a consistent 'partial file kept' message on any mid-transfer failure."""
-    ipv6_flag = " -6" if USE_IPV6 else ""
+    flags = (" -6" if USE_IPV6 else "") + (" --relay" if USE_RELAY else "")
     print(f"  Partial file saved: {working_path}")
-    print(f"  To resume:          python p2p.py recv{ipv6_flag} --resume \"{working_path}\"")
+    print(f"  To resume:          python p2p.py recv{flags} --resume \"{working_path}\"")
 
 
 # ===============================================================================
@@ -2496,9 +2520,11 @@ def cmd_recv(connect_timeout=CONNECT_TIMEOUT, max_size=MAX_FILE_SIZE, resume_pat
             sys.exit(1)
         try:
             secret = decode_relay_code(scode)
-        except Exception:
+        except Exception as e:
             print("  Error: invalid sender code.")
             print(f"  A relay code is {RELAY_CODE_WORDS} words. Make sure you copied the whole SEND CODE.")
+            if str(e).startswith("Unknown word"):
+                print(f"  {e} (check the spelling)")
             sock.close()
             sys.exit(1)
         salt = _relay_salt(secret)
@@ -2514,9 +2540,11 @@ def cmd_recv(connect_timeout=CONNECT_TIMEOUT, max_size=MAX_FILE_SIZE, resume_pat
             secret, salt, peer_pub_ip, peer_pub_port, peer_local_ip, peer_local_port, code_ipv6 = (
                 decode_sender_code(scode)
             )
-        except Exception:
+        except Exception as e:
             print("  Error: invalid sender code.")
             print("  Make sure you copied the entire SEND CODE from the sender's screen.")
+            if str(e).startswith("Unknown word"):
+                print(f"  {e} (check the spelling)")
             sock.close()
             sys.exit(1)
 

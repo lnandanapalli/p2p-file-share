@@ -4,6 +4,29 @@ Encrypted peer-to-peer file transfer over UDP hole punching. Single file, zero d
 
 Like Magic Wormhole, but you don't install anything.
 
+## No Python? Use `p2p.ps1` (Windows)
+
+`p2p.ps1` is a drop-in PowerShell client that speaks exactly the same protocol, codes and relay format as `p2p.py`. Either side can be Python or PowerShell, in any combination, in direct or `--relay` mode, including `--resume`.
+
+It needs nothing installed: it runs on the Windows PowerShell 5.1 that ships with Windows 10/11, and on PowerShell 7+ (`pwsh`) on any OS. Same commands and flags, just a different launcher:
+
+```
+.\p2p.ps1 send photo.jpg --relay
+.\p2p.ps1 recv --relay
+```
+
+If Windows says *"running scripts is disabled on this system"*, start it like this instead (this affects only this one run and changes no settings):
+
+```
+powershell -ExecutionPolicy Bypass -File .\p2p.ps1 recv --relay
+```
+
+Under the hood the transfer engine is C# embedded in the script, compiled in memory by PowerShell's built-in `Add-Type` on first run (a second or two). Plain PowerShell loops would be far too slow for per-packet crypto. Machines locked down by AppLocker / Device Guard (PowerShell "Constrained Language" mode) block `Add-Type`; the script detects that and says so.
+
+**Both machines need matching versions**: relay mode now uses 32 KB chunks, and a mismatched peer is refused up front with a clear message instead of producing a corrupted file.
+
+To rebuild `p2p.ps1` after editing the engine: `python build/build.py` (it embeds `build/engine.cs` and the word list from `p2p.py`).
+
 ## Quick start
 
 **Send a file:**

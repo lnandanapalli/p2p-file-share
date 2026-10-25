@@ -68,6 +68,7 @@ import zlib
 import http.client
 import threading
 import queue
+import collections
 
 # ===============================================================================
 # Configuration
@@ -84,6 +85,15 @@ STUN_SERVERS = [
 CHUNK_SIZE = 1400   # bytes per DATA packet payload (fits typical MTU)
 WINDOW_SIZE = 32    # max unACKed in-flight packets
 ACK_TIMEOUT = 2.5   # seconds before retransmitting; must exceed 2× max round-trip time
+
+# Relay mode travels over HTTPS/TCP, not raw UDP, so the MTU-sized chunk and
+# tiny window above only add overhead there: 32 x 1400 B = ~44 KB in flight
+# per relay round trip, which caps throughput at ~0.1 MB/s. In relay mode
+# main() swaps in these values instead (both sides must run this version).
+RELAY_CHUNK_SIZE  = 32 * 1024   # must stay < 65 KB (2-byte length in batch format)
+RELAY_WINDOW_SIZE = 96          # ~3 MB in flight per round trip
+RELAY_ACK_TIMEOUT = 15.0        # big batches on a slow uplink take seconds; TCP doesn't drop
+RELAY_BATCH_BYTES = 2 * 1024 * 1024   # cap per POST (relay rejects > 4 MiB)
 MAX_RETRIES = 200   # per-packet retransmit limit
 CONNECT_TIMEOUT = 3600   # seconds for all connection-phase waits
 PUNCH_INTERVAL = 0.25    # seconds between HELLO salvos
@@ -492,16 +502,22 @@ class Cipher:
 
     @staticmethod
     def _keystream(key, nonce, length):
-        out = bytearray()
-        blk = 0
-        while len(out) < length:
-            out += hashlib.sha256(key + nonce + struct.pack(">Q", blk)).digest()
-            blk += 1
-        return bytes(out[:length])
+        # Same output as sha256(key + nonce + be64(blk)) per 32-byte block,
+        # but hashes the shared prefix once and copies the state.
+        base = hashlib.sha256(key + nonce)
+        nblocks = (length + 31) // 32
+        parts = []
+        for blk in range(nblocks):
+            h = base.copy()
+            h.update(blk.to_bytes(8, "big"))
+            parts.append(h.digest())
+        return b"".join(parts)[:length]
 
     @staticmethod
     def _xor(a, b):
-        return bytes(x ^ y for x, y in zip(a, b))
+        # Whole-buffer XOR via big ints: ~100x faster than a per-byte generator.
+        n = len(a)
+        return (int.from_bytes(a, "big") ^ int.from_bytes(b[:n], "big")).to_bytes(n, "big")
 
     def encrypt(self, ptype: int, plaintext: bytes) -> bytes:
         nonce = struct.pack(">Q", self._ctr)
@@ -531,8 +547,12 @@ class Cipher:
         self._nonce_window.add(nonce_val)
         if nonce_val > self._max_nonce:
             self._max_nonce = nonce_val
-            new_floor = max(self._max_nonce - self._NONCE_WINDOW + 1, 0)
-            self._nonce_window = {n for n in self._nonce_window if n >= new_floor}
+            # Prune only occasionally. Rebuilding the whole set on every
+            # packet cost ~1 ms each. Anything below the floor is already
+            # rejected by the check above, so stale entries are harmless.
+            if len(self._nonce_window) > 2 * self._NONCE_WINDOW:
+                new_floor = max(self._max_nonce - self._NONCE_WINDOW + 1, 0)
+                self._nonce_window = {n for n in self._nonce_window if n >= new_floor}
         pt = self._xor(ct, self._keystream(self._dk, nonce, len(ct)))
         return ptype, pt
 
@@ -1256,11 +1276,14 @@ class RelaySocket:
         # like they would on a real UDP socket -- nothing here is a network
         # hop, it's just how incoming relay data gets surfaced through the
         # normal recvfrom()/select() calls the rest of the code already uses.
-        self._inject = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._inject.bind(("127.0.0.1", 0))
-        self._local = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._local.bind(("127.0.0.1", 0))
-        self._local_addr = self._local.getsockname()
+        #
+        # Packets themselves live in an in-memory deque; the socketpair only
+        # carries one "doorbell" byte per packet so select()/timeouts/
+        # non-blocking reads behave exactly like a UDP socket. (A loopback
+        # UDP socket was used before, but its OS buffer -- ~64 KB on Windows
+        # -- silently drops packets once the relay delivers big batches.)
+        self._in_q = collections.deque()
+        self._local, self._bell = socket.socketpair()
 
         self._out_q = queue.Queue()
         self._stop  = threading.Event()
@@ -1275,8 +1298,11 @@ class RelaySocket:
         self._out_q.put(bytes(data))
 
     def recvfrom(self, bufsize):
-        data, _ = self._local.recvfrom(bufsize)
-        return data, self.PEER_ADDR
+        # Honors blocking / timeout / non-blocking mode of self._local and
+        # raises OSError (incl. BlockingIOError, socket.timeout) like UDP.
+        if not self._local.recv(1):
+            raise OSError("relay socket closed")
+        return self._in_q.popleft(), self.PEER_ADDR
 
     def fileno(self):
         return self._local.fileno()
@@ -1289,7 +1315,7 @@ class RelaySocket:
 
     def close(self):
         self._stop.set()
-        for s in (self._inject, self._local):
+        for s in (self._bell, self._local):
             try:
                 s.close()
             except OSError:
@@ -1306,11 +1332,14 @@ class RelaySocket:
                     batch = [self._out_q.get(timeout=RELAY_FLUSH_WAIT)]
                 except queue.Empty:
                     continue
-                while len(batch) < WINDOW_SIZE:
+                nbytes = len(batch[0])
+                while len(batch) < WINDOW_SIZE and nbytes < RELAY_BATCH_BYTES:
                     try:
-                        batch.append(self._out_q.get_nowait())
+                        pkt = self._out_q.get_nowait()
                     except queue.Empty:
                         break
+                    batch.append(pkt)
+                    nbytes += len(pkt)
                 body = _encode_relay_batch(batch)
                 try:
                     status, _, retry_after = conn.request("POST", path, body)
@@ -1361,10 +1390,12 @@ class RelaySocket:
                     self._stop.wait(delay)
                     continue
                 for pkt in _decode_relay_batch(body):
+                    self._in_q.append(pkt)          # data first...
                     try:
-                        self._inject.sendto(pkt, self._local_addr)
+                        self._bell.sendall(b"\0")   # ...then ring
                     except OSError:
-                        pass
+                        self._in_q.pop()
+                        return                      # socket closed
         finally:
             conn.close()
 
@@ -1397,7 +1428,8 @@ def send_file_reliable(sock, peer, cipher, filepath, filesize, filehash,
 
     # ---- Send META until the receiver ACKs or declines ----------------------
     meta = json.dumps(
-        {"name": os.path.basename(filepath), "size": filesize, "hash": filehash}
+        {"name": os.path.basename(filepath), "size": filesize, "hash": filehash,
+         "chunk": CHUNK_SIZE}
     ).encode()
     meta_acked   = False
     meta_declined = False
@@ -1709,6 +1741,15 @@ def recv_file_reliable(sock, peer, cipher, connect_timeout=CONNECT_TIMEOUT,
             filesize = meta["size"]
             filehash = meta["hash"]
 
+            # Old senders don't send "chunk" and always used 1400.
+            peer_chunk = meta.get("chunk", 1400)
+            if peer_chunk != CHUNK_SIZE:
+                print(f"\n  Version mismatch: sender uses {peer_chunk}-byte chunks, "
+                      f"this side uses {CHUNK_SIZE}.\n"
+                      f"  Update p2p.py on BOTH machines to the same version.")
+                _send_abort_signal(sock, cipher, addr, "VERSION")
+                return None
+
             if filesize > max_size:
                 print(f"\n  File too large ({_fmt(filesize)}). "
                       f"Limit is {_fmt(max_size)}.")
@@ -1750,7 +1791,9 @@ def recv_file_reliable(sock, peer, cipher, connect_timeout=CONNECT_TIMEOUT,
                 else:
                     partial_chunks   = math.ceil(partial_size / CHUNK_SIZE)
                     confirmed_chunks = _resume_binary_search(
-                        sock, addr, cipher, resume_path, partial_chunks
+                        sock, addr, cipher, resume_path, partial_chunks,
+                        # keep bins ~25 MB regardless of chunk size
+                        chunks_per_bin=max(1, (RESUME_CHUNKS_PER_BIN * 1400) // CHUNK_SIZE),
                     )
                     if confirmed_chunks == 0:
                         print("  Partial file does not match this transfer -- "
@@ -2687,10 +2730,14 @@ def main():
             filtered.append(args[i])
             i += 1
     args = filtered
-    global VERBOSE, USE_IPV6, USE_RELAY
+    global VERBOSE, USE_IPV6, USE_RELAY, CHUNK_SIZE, WINDOW_SIZE, ACK_TIMEOUT
     VERBOSE        = verbose
     USE_IPV6       = use_ipv6
     USE_RELAY      = use_relay
+    if USE_RELAY:
+        CHUNK_SIZE  = RELAY_CHUNK_SIZE
+        WINDOW_SIZE = RELAY_WINDOW_SIZE
+        ACK_TIMEOUT = RELAY_ACK_TIMEOUT
     if old_no_relay:
         print("  Note: --no-relay is no longer needed; the relay is only used with --relay.")
     if use_relay and old_no_relay:

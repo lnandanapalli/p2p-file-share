@@ -7,7 +7,7 @@
   Windows 10/11, and on PowerShell 7+ (pwsh) on Windows, macOS and Linux.
 
   Usage (same flags as p2p.py):
-    .\p2p.ps1 send <file> [-6] [--relay] [--connect-timeout SECONDS] [--verbose]
+    .\p2p.ps1 send <file> [-6] [--relay] [--long-code] [--connect-timeout SECONDS] [--verbose]
     .\p2p.ps1 recv        [-6] [--relay] [--connect-timeout SECONDS] [--resume PARTIAL_FILE] [--verbose]
 
   If Windows blocks the script ("running scripts is disabled on this system"):
@@ -45,7 +45,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 
-namespace P2PShellV1
+namespace P2PShellV2
 {
     // ========================================================================
     // Configuration (mirrors p2p.py)
@@ -98,15 +98,33 @@ namespace P2PShellV1
                           T_DONEACK = 6, T_ABORT = 7, T_HASHQ = 8, T_HASHR = 9;
 
         public static bool Verbose, UseIPv6, UseRelay;
+        public static bool UseAes;     // set when both sides can do AES-256
+        public const byte CapAes = 1;  // HELLO capability bit: this side can do AES-256-CTR
+
+        public static byte MyCaps() { return AesCtr.Available ? CapAes : (byte)0; }
+
+        // AES-256-CTR if both sides can, else the SHA-256 cipher. Prints which.
+        public static void ChooseCipher(bool mine, bool theirs, string other)
+        {
+            UseAes = mine && theirs;
+            if (UseAes) U.Line("  Encryption: AES-256-CTR + HMAC-SHA256.");
+            else U.Line("  Encryption: SHA-256-CTR + HMAC-SHA256 (AES isn't available on " +
+                        (!mine ? "this machine" : "the " + other + "'s machine") + ").");
+        }
 
         public const string DirectHint =
             "\n  Taking a while. If this keeps failing (strict NAT, CG-NAT, VM networking),\n" +
             "  run BOTH sides again with --relay to connect through the relay instead.";
 
+        public static void UseRelayMode()
+        {
+            UseRelay = true; ChunkSize = RelayChunkSize; WindowSize = RelayWindowSize; AckTimeout = RelayAckTimeout;
+        }
+
         public static void Reset()
         {
             ChunkSize = DirectChunkSize; WindowSize = DirectWindowSize; AckTimeout = DirectAckTimeout;
-            RelayHost = DefaultRelayHost; Verbose = false; UseIPv6 = false; UseRelay = false;
+            RelayHost = DefaultRelayHost; Verbose = false; UseIPv6 = false; UseRelay = false; UseAes = false;
         }
     }
 
@@ -350,11 +368,78 @@ namespace P2PShellV1
     }
 
     // ========================================================================
+    // AES-256-CTR from .NET's built-in AES (ECB over counter blocks). Counter
+    // block = 8-byte packet nonce || 8-byte big-endian block index, the same
+    // layout p2p.py gets from OpenSSL. Used only when both sides can.
+    // ========================================================================
+    internal static class AesCtr
+    {
+        static int available = -1;
+
+        public static ICryptoTransform Create(byte[] key)
+        {
+            Aes a = Aes.Create();
+            a.Mode = CipherMode.ECB;
+            a.Padding = PaddingMode.None;
+            a.Key = key;
+            return a.CreateEncryptor();
+        }
+
+        // XOR data[offset..offset+len) in place with the keystream.
+        public static void Xor(ICryptoTransform ecb, byte[] nonce, byte[] data, int offset, int len)
+        {
+            if (len <= 0) return;
+            int nb = (len + 15) / 16;
+            byte[] ctr = new byte[nb * 16];
+            for (int b = 0; b < nb; b++)
+            {
+                Buffer.BlockCopy(nonce, 0, ctr, b * 16, 8);
+                Buffer.BlockCopy(U.BE64((ulong)b), 0, ctr, b * 16 + 8, 8);
+            }
+            byte[] ks = new byte[ctr.Length];
+            ecb.TransformBlock(ctr, 0, ctr.Length, ks, 0);
+            for (int i = 0; i < len; i++) data[offset + i] ^= ks[i];
+        }
+
+        // NIST SP 800-38A F.5.5 (CTR-AES256) known-answer test before trusting it.
+        public static bool Available
+        {
+            get
+            {
+                if (available < 0)
+                {
+                    try
+                    {
+                        byte[] key = FromHex("603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4");
+                        byte[] ctr = FromHex("f0f1f2f3f4f5f6f7f8f9fafbfcfdfefff0f1f2f3f4f5f6f7f8f9fafbfcfdff00");
+                        byte[] pt = FromHex("6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e51");
+                        byte[] ct = FromHex("601ec313775789a5b7a7f504bbf3d228f443e3ca4d62b59aca84e990cacaf5c5");
+                        byte[] ks = new byte[32];
+                        Create(key).TransformBlock(ctr, 0, 32, ks, 0);
+                        for (int i = 0; i < 32; i++) ks[i] ^= pt[i];
+                        available = U.ConstEq(ks, ct) ? 1 : 0;
+                    }
+                    catch { available = 0; }
+                }
+                return available == 1;
+            }
+        }
+
+        static byte[] FromHex(string h)
+        {
+            byte[] r = new byte[h.Length / 2];
+            for (int i = 0; i < r.Length; i++) r[i] = Convert.ToByte(h.Substring(2 * i, 2), 16);
+            return r;
+        }
+    }
+
+    // ========================================================================
     // Cipher -- identical construction to p2p.py's Cipher
     // ========================================================================
     internal class Cipher
     {
         readonly byte[] ek, mk, dk, dmk;
+        readonly ICryptoTransform encAes, decAes;   // null unless both sides do AES
         readonly HMACSHA256 encMac, decMac;
         readonly SHA256 sha = U.NewSha();
         readonly byte[] ksIn = new byte[48];     // key(32) + nonce(8) + blk(8)
@@ -363,7 +448,7 @@ namespace P2PShellV1
         HashSet<ulong> window = new HashSet<ulong>();
         const int NonceWindow = 65536;
 
-        public Cipher(byte[] secret, byte[] salt, bool isSender)
+        public Cipher(byte[] secret, byte[] salt, bool isSender, bool aes)
         {
             byte[] km = Pbkdf2Sha256(secret, salt, 100000, 128);
             byte[] s2rEnc = U.Slice(km, 0, 32), s2rMac = U.Slice(km, 32, 32);
@@ -372,6 +457,7 @@ namespace P2PShellV1
             else          { ek = r2sEnc; mk = r2sMac; dk = s2rEnc; dmk = s2rMac; }
             encMac = new HMACSHA256(mk);
             decMac = new HMACSHA256(dmk);
+            if (aes) { encAes = AesCtr.Create(ek); decAes = AesCtr.Create(dk); }
         }
 
         // RFC 8018 PBKDF2 with HMAC-SHA256 (Rfc2898DeriveBytes only supports
@@ -422,7 +508,8 @@ namespace P2PShellV1
             pkt[0] = ptype;
             Buffer.BlockCopy(nonce, 0, pkt, 1, 8);
             Buffer.BlockCopy(plaintext, 0, pkt, 9, plaintext.Length);
-            XorKeystream(ek, nonce, pkt, 9, plaintext.Length);
+            if (encAes != null) AesCtr.Xor(encAes, nonce, pkt, 9, plaintext.Length);
+            else XorKeystream(ek, nonce, pkt, 9, plaintext.Length);
             byte[] mac = encMac.ComputeHash(pkt, 0, 9 + plaintext.Length);
             Buffer.BlockCopy(mac, 0, pkt, 9 + plaintext.Length, 16);
             return pkt;
@@ -458,7 +545,8 @@ namespace P2PShellV1
             }
             ptype = raw[0];
             payload = U.Slice(raw, 9, ctLen);
-            XorKeystream(dk, U.Slice(raw, 1, 8), payload, 0, ctLen);
+            if (decAes != null) AesCtr.Xor(decAes, U.Slice(raw, 1, 8), payload, 0, ctLen);
+            else XorKeystream(dk, U.Slice(raw, 1, 8), payload, 0, ctLen);
             return true;
         }
     }
@@ -526,6 +614,8 @@ namespace P2PShellV1
             for (int i = 0; i < List.Length; i++) d[List[i]] = i;
             return d;
         }
+
+        public static bool IsWord(string w) { return Index.ContainsKey(w); }
 
         public static string[] Split(string phrase)
         {
@@ -952,6 +1042,280 @@ namespace P2PShellV1
     }
 
     // ========================================================================
+    // Short codes: SPAKE2 password-authenticated key exchange (the default)
+    // ========================================================================
+    //
+    // Same scheme as p2p.py. The sender gets a code such as
+    // "4821-apple-river-ocean": the number only picks a mailbox on the relay
+    // (not secret); the words are a short password that SPAKE2 (RFC 9382)
+    // turns into a strong key. The relay can't brute-force it offline, and
+    // a wrong guess aborts both sides. SPAKE2 runs in RFC 3526 group 14: 2
+    // generates the subgroup of prime order q = (p-1)/2, and M, N are hashed
+    // into it (hash, then square). In direct mode the two sides then swap
+    // their addresses, encrypted under the new key, and leave the relay.
+    internal class PakeMismatchException : Exception { }
+
+    internal static class Pake
+    {
+        public const int Words = 3;
+        public const double Resend = 5.0;      // seconds between rendezvous resends
+        public const double ReplyGap = 1.0;    // min gap between replies to a peer's repeats
+        public const byte Version = 1, FRelay = 1, FIPv6 = 2, FAes = 4;
+        public static readonly byte[] Magic = Encoding.ASCII.GetBytes("SPK1");
+        public static readonly BigInteger Q = (DH.P - 1) / 2;
+        public static readonly BigInteger M = HashToGroup("p2p-spake2-M-v1");
+        public static readonly BigInteger N = HashToGroup("p2p-spake2-N-v1");
+
+        static BigInteger HashToGroup(string label)
+        {
+            byte[] l = Encoding.ASCII.GetBytes(label);
+            List<byte> o = new List<byte>();
+            for (uint ctr = 0; o.Count < DH.KeyBytes + 32; ctr++) o.AddRange(U.Sha256(U.Cat(l, U.BE32(ctr))));
+            return BigInteger.ModPow(DH.FromBE(o.ToArray()) % DH.P, 2, DH.P);
+        }
+
+        public static BigInteger RandBelow(BigInteger n)
+        {
+            return DH.FromBE(U.Rand(DH.KeyBytes + 16)) % n;     // 128 extra bits: negligible bias
+        }
+
+        public static string MakeCode()
+        {
+            List<string> parts = new List<string>();
+            parts.Add((1000 + (int)RandBelow(9000)).ToString(CultureInfo.InvariantCulture));
+            for (int i = 0; i < Words; i++) parts.Add(Codes.List[(int)RandBelow(Codes.List.Length)]);
+            return string.Join("-", parts.ToArray());
+        }
+
+        // "4821-apple-river-ocean" (dashes or spaces, any case). Returns false if
+        // this isn't a short code at all (the caller then tries the long formats);
+        // throws FormatException if it looks like one but is malformed.
+        public static bool ParseCode(string code, out string nameplate, out byte[] password)
+        {
+            nameplate = null; password = null;
+            string[] parts = Codes.Split(code.Replace('-', ' '));
+            if (parts.Length == 0) return false;
+            foreach (char ch in parts[0]) if (ch < '0' || ch > '9') return false;
+            if (parts[0].Length > 6 || parts.Length != 1 + Words)
+                throw new FormatException("A short code is a number and " + Words + " words, like 4821-apple-river-ocean.");
+            for (int i = 1; i < parts.Length; i++)
+                if (!Codes.IsWord(parts[i])) throw new FormatException("Unknown word: '" + parts[i] + "'");
+            nameplate = int.Parse(parts[0], CultureInfo.InvariantCulture).ToString(CultureInfo.InvariantCulture);
+            parts[0] = nameplate;
+            password = Encoding.ASCII.GetBytes(string.Join("-", parts));
+            return true;
+        }
+
+        // From the nameplate only: the relay must never see anything derived
+        // from the password, or it could test guesses offline.
+        public static string Token(string nameplate)
+        {
+            return U.Hex(U.Sha256(Encoding.ASCII.GetBytes("p2p-pake-nameplate-v1:" + nameplate))).Substring(0, 32);
+        }
+
+        public static byte[] Salt(byte[] secret)
+        {
+            return U.Hmac16(secret, Encoding.ASCII.GetBytes("p2p-pake-salt-v1"));
+        }
+
+        public static byte[] Kdf(byte[] h, string label) { return U.Hmac(h, Encoding.ASCII.GetBytes(label)); }
+
+        // SHA-256-CTR keystream, same as p2p.py's Cipher._keystream with a
+        // fixed nonce of 8 x kind. Each (key, kind) seals exactly one message.
+        static void XorKs(byte[] key, byte kind, byte[] data)
+        {
+            byte[] nonce = new byte[8];
+            for (int i = 0; i < 8; i++) nonce[i] = kind;
+            ulong blk = 0;
+            for (int pos = 0; pos < data.Length; pos += 32, blk++)
+            {
+                byte[] ks = U.Sha256(U.Cat(key, nonce, U.BE64(blk)));
+                int n = Math.Min(32, data.Length - pos);
+                for (int i = 0; i < n; i++) data[pos + i] ^= ks[i];
+            }
+        }
+
+        // key = { encKey, macKey }. Encrypt-then-MAC with a full 32-byte tag.
+        public static byte[] Seal(byte[][] key, byte kind, byte[] payload)
+        {
+            byte[] ct = (byte[])payload.Clone();
+            XorKs(key[0], kind, ct);
+            byte[] k1 = new byte[] { kind };
+            return U.Cat(Magic, k1, ct, U.Hmac(key[1], U.Cat(k1, ct)));
+        }
+
+        public static byte[] Open(byte[][] key, byte kind, byte[] body)
+        {
+            if (body.Length < 32) return null;
+            byte[] ct = U.Slice(body, 0, body.Length - 32), tag = U.Slice(body, body.Length - 32, 32);
+            byte[] k1 = new byte[] { kind };
+            if (!U.ConstEq(tag, U.Hmac(key[1], U.Cat(k1, ct)))) return null;
+            XorKs(key[0], kind, ct);
+            return ct;
+        }
+    }
+
+    // One side of SPAKE2. The sender plays A (uses M), the receiver B (uses N).
+    internal class Spake2
+    {
+        readonly BigInteger w, x, theirs;
+        readonly bool isSender;
+        public readonly byte[] Msg;
+
+        public Spake2(byte[] password, bool isSender)
+        {
+            this.isSender = isSender;
+            byte[] h;
+            using (HMACSHA512 hm = new HMACSHA512(Encoding.ASCII.GetBytes("p2p-spake2-pw-v1"))) h = hm.ComputeHash(password);
+            w = DH.FromBE(h) % (Pake.Q - 1) + 1;
+            x = Pake.RandBelow(Pake.Q - 1) + 1;
+            BigInteger mine = isSender ? Pake.M : Pake.N;
+            theirs = isSender ? Pake.N : Pake.M;
+            Msg = DH.ToBE(BigInteger.ModPow(2, x, DH.P) * BigInteger.ModPow(mine, w, DH.P) % DH.P, DH.KeyBytes);
+        }
+
+        // Returns the 32-byte transcript hash. Throws ArgumentException on a bad element.
+        public byte[] Finish(byte[] peerMsg)
+        {
+            if (peerMsg.Length != DH.KeyBytes) throw new ArgumentException("bad SPAKE2 element length");
+            BigInteger y = DH.FromBE(peerMsg);
+            if (y <= 1 || y >= DH.P - 1 || !BigInteger.ModPow(y, Pake.Q, DH.P).IsOne)
+                throw new ArgumentException("SPAKE2 element not in the group");
+            // Strip the peer's password mask (theirs^-w = theirs^(q-w)), then DH.
+            BigInteger unmasked = y * BigInteger.ModPow(theirs, Pake.Q - w, DH.P) % DH.P;
+            BigInteger k = BigInteger.ModPow(unmasked, x, DH.P);
+            byte[][] parts = {
+                Encoding.ASCII.GetBytes("p2p-sender"), Encoding.ASCII.GetBytes("p2p-receiver"),
+                isSender ? Msg : peerMsg, isSender ? peerMsg : Msg,
+                DH.ToBE(k, DH.KeyBytes), DH.ToBE(w, DH.KeyBytes) };
+            List<byte[]> tt = new List<byte[]>();
+            foreach (byte[] p in parts) { tt.Add(U.BE64((ulong)p.Length)); tt.Add(p); }
+            return U.Sha256(U.Cat(tt.ToArray()));
+        }
+    }
+
+    // SPAKE2 + small authenticated messages over the relay mailbox.
+    internal class PakeSession
+    {
+        readonly bool isSender;
+        readonly Spake2 spake;
+        readonly byte[] elemPkt;
+        readonly RelaySock sock;
+        byte[] confPkt;
+        byte[][] mine, theirs;
+        public byte[] Secret;
+
+        public PakeSession(string nameplate, byte[] password, bool isSender)
+        {
+            this.isSender = isSender;
+            spake = new Spake2(password, isSender);
+            elemPkt = U.Cat(Pake.Magic, new byte[] { (byte)'E' }, spake.Msg);
+            sock = new RelaySock(Pake.Token(nameplate), isSender ? "s2r" : "r2s", isSender ? "r2s" : "s2r");
+        }
+
+        public void Close() { sock.Close(); }
+
+        void Send(params byte[][] pkts)
+        {
+            foreach (byte[] p in pkts) if (p != null) sock.SendTo(p, RelaySock.PeerAddr);
+        }
+
+        bool Recv(double timeout, out byte kind, out byte[] body)
+        {
+            kind = 0; body = null;
+            byte[] pkt; IPEndPoint from;
+            if (!sock.Recv(timeout, out pkt, out from)) return false;
+            if (pkt.Length < 5) return false;
+            for (int i = 0; i < 4; i++) if (pkt[i] != Pake.Magic[i]) return false;
+            kind = pkt[4];
+            body = U.Slice(pkt, 5, pkt.Length - 5);
+            return true;
+        }
+
+        // Run SPAKE2 and key confirmation. Returns the peer's flags, or -1 on
+        // timeout. Throws PakeMismatchException if the codes differ.
+        public int Handshake(byte myFlags, double timeout, string status, string hint)
+        {
+            byte[] info = new byte[] { Pake.Version, myFlags };
+            double start = U.Now(), lastSend = start, lastReply = start;
+            int lastShown = -1;
+            bool hintShown = false;
+            Send(elemPkt);
+            while (U.Now() - start < timeout)
+            {
+                U.CheckCancel();
+                double now = U.Now();
+                if (now - lastSend >= Pake.Resend) { Send(elemPkt, confPkt); lastSend = now; }
+                int elapsed = (int)(now - start);
+                if (elapsed != lastShown)
+                {
+                    lastShown = elapsed;
+                    if (hint != null && !hintShown && elapsed >= Cfg.DirectHintAfter) { hintShown = true; U.Out("\n" + hint + "\n"); }
+                    U.Out("\r  " + status + " " + U.Elapsed(elapsed) + "  ");
+                }
+
+                byte kind; byte[] body;
+                if (!Recv(0.25, out kind, out body)) continue;
+                if (kind == (byte)'E')
+                {
+                    if (Secret == null)
+                    {
+                        byte[] h;
+                        try { h = spake.Finish(body); }
+                        catch (ArgumentException) { continue; }
+                        byte[][] s2r = { Pake.Kdf(h, "p2p-pake-enc-s2r"), Pake.Kdf(h, "p2p-pake-mac-s2r") };
+                        byte[][] r2s = { Pake.Kdf(h, "p2p-pake-enc-r2s"), Pake.Kdf(h, "p2p-pake-mac-r2s") };
+                        mine = isSender ? s2r : r2s;
+                        theirs = isSender ? r2s : s2r;
+                        Secret = Pake.Kdf(h, "p2p-pake-session");
+                        confPkt = Pake.Seal(mine, (byte)'C', info);
+                        Send(elemPkt, confPkt);
+                        lastSend = lastReply = now;
+                    }
+                    else if (now - lastReply >= Pake.ReplyGap)
+                    {
+                        // The peer is still repeating itself: maybe it missed ours.
+                        Send(elemPkt, confPkt);
+                        lastReply = now;
+                    }
+                }
+                else if (kind == (byte)'C' && Secret != null)
+                {
+                    byte[] peerInfo = Pake.Open(theirs, (byte)'C', body);
+                    if (peerInfo == null || peerInfo.Length < 2 || peerInfo[0] != Pake.Version)
+                        throw new PakeMismatchException();
+                    U.Line();
+                    return peerInfo[1];
+                }
+            }
+            U.Line();
+            return -1;
+        }
+
+        // Swap one encrypted message of `kind` with the peer (after Handshake).
+        public byte[] Exchange(byte kind, byte[] payload, double timeout)
+        {
+            byte[] pkt = Pake.Seal(mine, kind, payload);
+            double start = U.Now(), lastSend = double.NegativeInfinity;
+            while (U.Now() - start < timeout)
+            {
+                U.CheckCancel();
+                double now = U.Now();
+                if (now - lastSend >= Pake.Resend)
+                {
+                    Send(confPkt, pkt);     // our confirmation too, in case the peer missed it
+                    lastSend = now;
+                }
+                byte k; byte[] body;
+                if (!Recv(0.25, out k, out body) || k != kind) continue;
+                byte[] p = Pake.Open(theirs, kind, body);
+                if (p != null) return p;
+            }
+            return null;
+        }
+    }
+
+    // ========================================================================
     // Network helpers: STUN, local IP, address comparison
     // ========================================================================
     internal static class Net
@@ -1118,15 +1482,15 @@ namespace P2PShellV1
 
         public static bool PunchHole(IPktSock sock, Cipher c, IPEndPoint pub, IPEndPoint local,
                                      byte[] dhPub, double timeout, string hint,
-                                     out IPEndPoint peer, out byte[] peerDhPub)
+                                     out IPEndPoint peer, out byte[] peerDhPub, out byte peerCaps)
         {
-            peer = null; peerDhPub = null;
+            peer = null; peerDhPub = null; peerCaps = 0;
             List<IPEndPoint> targets = new List<IPEndPoint>();
             targets.Add(pub);
             if (local != null && !Net.SameAddr(local, pub)) targets.Add(local);
 
             Drain(sock);
-            byte[] hello = c.Encrypt(Cfg.T_HELLO, U.Cat(Encoding.ASCII.GetBytes("DH1:"), dhPub));
+            byte[] hello = c.Encrypt(Cfg.T_HELLO, U.Cat(Encoding.ASCII.GetBytes("DH2:"), dhPub, new byte[] { Cfg.MyCaps() }));
             double start = U.Now();
             string status = Cfg.Verbose ? "Punching through NAT..." : "Connecting...";
             U.Out("  " + status);
@@ -1147,10 +1511,11 @@ namespace P2PShellV1
                     if (match == null) continue;
                     byte pt; byte[] pl;
                     if (!c.Decrypt(data, out pt, out pl)) continue;
-                    if (pt == Cfg.T_HELLO && pl.Length >= 4 && pl[0] == 'D' && pl[1] == 'H' && pl[2] == '1' && pl[3] == ':')
+                    if (pt == Cfg.T_HELLO && pl.Length >= 4 && pl[0] == 'D' && pl[1] == 'H' && pl[2] == '2' && pl[3] == ':')
                     {
-                        if (pl.Length - 4 != DH.KeyBytes) continue;
+                        if (pl.Length != 4 + DH.KeyBytes + 1) continue;
                         peerDhPub = U.Slice(pl, 4, DH.KeyBytes);
+                        peerCaps = pl[pl.Length - 1];
                         for (int i = 0; i < 5; i++) { sock.SendTo(hello, from); Thread.Sleep(50); }
                         if (Cfg.Verbose) U.Line("\n  Connected to " + Net.FmtAddr(from));
                         else U.Line("\n  Connected.");
@@ -1843,7 +2208,7 @@ namespace P2PShellV1
             "\n" +
             "  +-----------------------------------------+\n" +
             "  |   p2p.ps1 -- encrypted hole-punch xfer  |\n" +
-            "  |   no dependencies . p2p.py compatible   |\n" +
+            "  |   short PAKE codes . p2p.py compatible  |\n" +
             "  +-----------------------------------------+\n";
 
         static bool handlerInstalled;
@@ -1865,10 +2230,14 @@ namespace P2PShellV1
         static void Usage()
         {
             U.Line("  Usage:");
-            U.Line("    .\\p2p.ps1 send <file> [-6] [--relay] [--connect-timeout SECONDS] [--verbose]");
+            U.Line("    .\\p2p.ps1 send <file> [-6] [--relay] [--long-code] [--connect-timeout SECONDS] [--verbose]");
             U.Line("    .\\p2p.ps1 recv        [-6] [--relay] [--connect-timeout SECONDS] [--resume PARTIAL_FILE] [--verbose]");
             U.Line();
             U.Line("  Works with p2p.py on the other side (either side can be Python or PowerShell).");
+            U.Line();
+            U.Line("  The sender gets a short code like 4821-apple-river-ocean; the receiver");
+            U.Line("  types it in. Both sides meet briefly at the relay to verify the code");
+            U.Line("  (SPAKE2) and swap addresses, then the file goes directly peer-to-peer.");
             U.Line();
             U.Line("  -6                 Use IPv6 (both sides must agree). Bypasses NAT");
             U.Line("                     entirely -- works wherever IPv6 is available.");
@@ -1879,10 +2248,13 @@ namespace P2PShellV1
             U.Line("                     how much was received correctly and resume from there.");
             U.Line("  --verbose          Show technical connection details such as IP");
             U.Line("                     addresses, STUN status, and handshake status.");
-            U.Line("  --relay            Connect through the HTTPS relay instead of direct");
-            U.Line("                     hole punching. BOTH sides must use it. Uses one");
-            U.Line("                     short code (13 words) from the sender only.");
-            U.Line("                     Without this flag the relay is never contacted.");
+            U.Line("  --relay            Send the file itself through the HTTPS relay instead");
+            U.Line("                     of direct hole punching. With short codes, one side");
+            U.Line("                     using it is enough.");
+            U.Line("  --long-code        (send) Use the old long word codes instead: no relay");
+            U.Line("                     at all in direct mode, but the receiver has to send");
+            U.Line("                     a code back. With --relay: one 13-word code, and");
+            U.Line("                     both sides must use --relay.");
             U.Line("  --relay-host HOST  Override the relay server (default: " + Cfg.DefaultRelayHost + ").");
         }
 
@@ -1927,7 +2299,7 @@ namespace P2PShellV1
 
             int connectTimeout = Cfg.DefaultConnectTimeout;
             string resumePath = null;
-            bool oldNoRelay = false;
+            bool oldNoRelay = false, longCode = false;
             List<string> args = new List<string>();
             for (int i = 0; i < argv.Length; i++)
             {
@@ -1945,34 +2317,33 @@ namespace P2PShellV1
                 else if (a == "--verbose") Cfg.Verbose = true;
                 else if (a == "-6" || a == "--ipv6") Cfg.UseIPv6 = true;
                 else if (a == "--relay") Cfg.UseRelay = true;
+                else if (a == "--long-code") longCode = true;
                 else if (a == "--no-relay") oldNoRelay = true;
                 else if (a == "--relay-host" && i + 1 < argv.Length) Cfg.RelayHost = argv[++i];
                 else args.Add(a);
             }
-            if (Cfg.UseRelay)
-            {
-                Cfg.ChunkSize = Cfg.RelayChunkSize;
-                Cfg.WindowSize = Cfg.RelayWindowSize;
-                Cfg.AckTimeout = Cfg.RelayAckTimeout;
-            }
+            if (Cfg.UseRelay) Cfg.UseRelayMode();
             if (oldNoRelay) U.Line("  Note: --no-relay is no longer needed; the relay is only used with --relay.");
             if (Cfg.UseRelay && oldNoRelay) { U.Line("  Error: --relay and --no-relay cannot be used together."); return 1; }
             if (args.Count == 0) { U.Line("  Use 'send' or 'recv'.  Run with -h for help."); return 1; }
 
             string cmd = args[0].ToLowerInvariant();
-            if (Cfg.UseRelay && (cmd == "send" || cmd == "recv" || cmd == "receive"))
+            // Short codes always meet at the relay; a receiver only knows which kind
+            // of code it has once it is pasted, so CmdRecv checks that case itself.
+            if ((Cfg.UseRelay && (cmd == "send" || cmd == "recv" || cmd == "receive")) || (cmd == "send" && !longCode))
             {
                 if (!Http.Reachable())
                 {
                     U.Line("  Error: cannot reach the relay at " + Cfg.RelayHost + ".");
                     U.Line("  Check your internet connection, or point at another relay with --relay-host.");
+                    if (!Cfg.UseRelay) U.Line("  Or use --long-code for a direct transfer that never contacts the relay.");
                     return 1;
                 }
             }
             if (cmd == "send")
             {
                 if (args.Count < 2) { U.Line("  Usage: .\\p2p.ps1 send <file> [-6]"); return 1; }
-                return CmdSend(args[1], connectTimeout);
+                return CmdSend(args[1], connectTimeout, longCode);
             }
             if (cmd == "recv" || cmd == "receive") return CmdRecv(connectTimeout, resumePath);
             U.Line("  Unknown command: '" + args[0] + "'");
@@ -1980,13 +2351,17 @@ namespace P2PShellV1
             return 1;
         }
 
-        static void SetupEndpoints(out UdpSock sock, out IPEndPoint pub, out IPEndPoint local)
+        static void BindUdp(out UdpSock sock, out IPEndPoint local)
         {
             try { sock = new UdpSock(Cfg.UseIPv6); }
             catch (Exception e) { U.Line("  Error: cannot create UDP socket: " + e.Message); throw new ExitException(1); }
             local = new IPEndPoint(Net.LocalIp(), sock.LocalPort);
+        }
 
-            IPEndPoint stun = null;
+        // STUN (skipped in relay mode). Returns the public endpoint.
+        static IPEndPoint Discover(UdpSock sock, IPEndPoint local)
+        {
+            IPEndPoint stun = null, pub;
             if (Cfg.UseRelay) U.V("  Relay mode: skipping STUN and hole punching.");
             else { U.V("  Discovering public endpoint via STUN..."); stun = Net.StunDiscover(sock); }
 
@@ -2006,9 +2381,84 @@ namespace P2PShellV1
             }
             U.V("  Local  : " + Net.FmtAddr(local));
             if (!Cfg.UseRelay && Net.IsCgnat(pub.Address)) U.Line(Net.CgnatWarning(pub.Address));
+            return pub;
         }
 
-        static int CmdSend(string filepath, int connectTimeout)
+        // Short-code flow: meet the peer at the relay, run SPAKE2, agree on the
+        // mode and (direct mode only) swap addresses. The peer addresses stay
+        // null in relay mode. Throws ExitException on failure.
+        static void PakeConnect(string code, bool isSender, UdpSock sock, IPEndPoint local, int connectTimeout,
+                                out byte[] secret, out byte[] salt, out IPEndPoint peerPub, out IPEndPoint peerLocal)
+        {
+            secret = null; salt = null; peerPub = null; peerLocal = null;
+            string nameplate; byte[] password;
+            Pake.ParseCode(code, out nameplate, out password);
+            byte myFlags = (byte)((Cfg.UseRelay ? Pake.FRelay : 0) | (Cfg.UseIPv6 ? Pake.FIPv6 : 0) |
+                                  (AesCtr.Available ? Pake.FAes : 0));
+            string other = isSender ? "receiver" : "sender";
+            PakeSession sess = new PakeSession(nameplate, password, isSender);
+            try
+            {
+                string status = isSender ? "Waiting for the receiver to enter the code..." : "Finding the sender...";
+                string hint = isSender ? null :
+                    "\n  Taking a while. Check that the sender is still waiting and that the\n" +
+                    "  number at the start of the code is right.";
+                int peerFlags;
+                try { peerFlags = sess.Handshake(myFlags, connectTimeout, status, hint); }
+                catch (PakeMismatchException)
+                {
+                    U.Line("\n  Error: the codes didn't match.");
+                    U.Line("  Check the code for typos. Each code allows only one attempt, so the");
+                    U.Line("  sender has to run 'send' again for a new code.");
+                    throw new ExitException(1);
+                }
+                if (peerFlags < 0) { U.Line("  Timed out: the " + other + " never showed up."); throw new ExitException(1); }
+                U.Line("  Code verified.");
+                // Short codes pick the cipher here, so even the HELLOs use it.
+                Cfg.ChooseCipher((myFlags & Pake.FAes) != 0, (peerFlags & Pake.FAes) != 0, other);
+
+                if (((myFlags | peerFlags) & Pake.FRelay) != 0)
+                {
+                    if (!Cfg.UseRelay) U.Line("  The " + other + " asked for --relay, so the transfer goes through the relay.");
+                    Cfg.UseRelayMode();
+                    secret = sess.Secret;
+                    salt = Pake.Salt(secret);
+                    return;
+                }
+
+                bool peerV6 = (peerFlags & Pake.FIPv6) != 0;
+                if (peerV6 != Cfg.UseIPv6)
+                {
+                    U.Line("  Error: address-family mismatch.");
+                    U.Line("  The " + other + " is using " + (peerV6 ? "IPv6 (-6)" : "IPv4") +
+                           ". Both sides must agree on -6 (or neither), or use --relay.");
+                    throw new ExitException(1);
+                }
+
+                // STUN only now, with both sides present, so the NAT mapping is
+                // fresh when hole punching starts.
+                IPEndPoint pub = Discover(sock, local);
+                byte[] mine = U.Cat(Codes.IpPack(pub.Address), U.BE16(pub.Port),
+                                    Codes.IpPack(local.Address), U.BE16(local.Port));
+                byte[] theirs = sess.Exchange((byte)'A', mine, connectTimeout);
+                if (theirs == null || theirs.Length != mine.Length)
+                {
+                    U.Line("  Error: lost contact with the " + other + " while exchanging addresses.");
+                    throw new ExitException(1);
+                }
+                int al = Cfg.UseIPv6 ? 16 : 4;
+                peerPub = new IPEndPoint(new IPAddress(U.Slice(theirs, 0, al)), U.RdBE16(theirs, al));
+                peerLocal = new IPEndPoint(new IPAddress(U.Slice(theirs, al + 2, al)), U.RdBE16(theirs, 2 * al + 2));
+                U.V("  Peer public : " + Net.FmtAddr(peerPub));
+                U.V("  Peer local  : " + Net.FmtAddr(peerLocal));
+                secret = sess.Secret;
+                salt = Pake.Salt(secret);
+            }
+            catch (CancelledException) { U.Line("\n  Cancelled."); throw new ExitException(0); }
+            finally { sess.Close(); }
+        }
+
+        static int CmdSend(string filepath, int connectTimeout, bool longCode)
         {
             if (!File.Exists(filepath)) { U.Line("  Error: '" + filepath + "' not found or is not a file."); return 1; }
             string filename = Path.GetFileName(filepath);
@@ -2022,15 +2472,21 @@ namespace P2PShellV1
             try { filehash = Proto.FileSha256(filepath); }
             catch (Exception e) { U.Line("  Error: cannot read file: " + e.Message); return 1; }
 
-            UdpSock sock; IPEndPoint pub, local;
-            SetupEndpoints(out sock, out pub, out local);
+            UdpSock sock; IPEndPoint local;
+            BindUdp(out sock, out local);
             RelaySock relay = null;
             try
             {
-                byte[] secret = U.Rand(16), salt;
+                byte[] secret = null, salt = null;
                 string code;
-                if (Cfg.UseRelay) { salt = Codes.RelaySalt(secret); code = Codes.BytesToWords(secret); }
-                else { salt = U.Rand(16); code = Codes.EncodeSender(secret, salt, pub, local); }
+                if (!longCode) code = Pake.MakeCode();
+                else
+                {
+                    IPEndPoint pub = Discover(sock, local);
+                    secret = U.Rand(16);
+                    if (Cfg.UseRelay) { salt = Codes.RelaySalt(secret); code = Codes.BytesToWords(secret); }
+                    else { salt = U.Rand(16); code = Codes.EncodeSender(secret, salt, pub, local); }
+                }
 
                 U.Line();
                 U.Line("  +==========================================================+");
@@ -2041,7 +2497,13 @@ namespace P2PShellV1
                 U.Line();
 
                 IPEndPoint peerPub = null, peerLocal = null;
-                if (Cfg.UseRelay)
+                if (!longCode)
+                {
+                    // Short code: the receiver types it in and both sides meet at
+                    // the relay; there is nothing to paste back.
+                    PakeConnect(code, true, sock, local, connectTimeout, out secret, out salt, out peerPub, out peerLocal);
+                }
+                else if (Cfg.UseRelay)
                     U.Line("  Relay mode: nothing to paste back. The receiver needs only the code above.");
                 else
                 {
@@ -2055,7 +2517,7 @@ namespace P2PShellV1
                     if (nw != expect)
                     {
                         U.Line("  Error: invalid receiver code.");
-                        if (!Cfg.UseIPv6 && nw == 42) U.Line("  The receiver is using IPv6 (-6). Re-run: .\\p2p.ps1 send <file> -6");
+                        if (!Cfg.UseIPv6 && nw == 42) U.Line("  The receiver is using IPv6 (-6). Re-run: .\\p2p.ps1 send <file> -6 --long-code");
                         else if (Cfg.UseIPv6 && nw == 23) U.Line("  The receiver is using IPv4. Both sides must agree on -6 (or neither).");
                         else U.Line("  Make sure you copied the entire RECV CODE from the receiver's screen.");
                         return 1;
@@ -2075,20 +2537,20 @@ namespace P2PShellV1
                 }
 
                 U.V("  Deriving handshake keys (PBKDF2, 100k rounds)...");
-                Cipher hs = new Cipher(secret, salt, true);
+                Cipher hs = new Cipher(secret, salt, true, Cfg.UseAes);
                 BigInteger dhPriv; byte[] dhPub;
                 DH.Keypair(out dhPriv, out dhPub);
 
-                IPEndPoint peer; byte[] peerDh;
+                IPEndPoint peer; byte[] peerDh; byte peerCaps;
                 IPktSock xfer;
                 try
                 {
                     if (Cfg.UseRelay)
                     {
-                        U.Line("  Relay mode: connecting through the relay (receiver must also use --relay).");
+                        U.Line("  Relay mode: connecting through the relay" + (longCode ? " (receiver must also use --relay)." : "."));
                         relay = new RelaySock(Codes.RelayToken(secret), "s2r", "r2s");
                         xfer = relay;
-                        if (!Proto.PunchHole(relay, hs, RelaySock.PeerAddr, RelaySock.PeerAddr, dhPub, connectTimeout, null, out peer, out peerDh))
+                        if (!Proto.PunchHole(relay, hs, RelaySock.PeerAddr, RelaySock.PeerAddr, dhPub, connectTimeout, null, out peer, out peerDh, out peerCaps))
                         {
                             U.Line("  Could not reach the receiver through the relay.");
                             U.Line("  Possible causes:");
@@ -2101,7 +2563,7 @@ namespace P2PShellV1
                     else
                     {
                         xfer = sock;
-                        if (!Proto.PunchHole(sock, hs, peerPub, peerLocal, dhPub, connectTimeout, Cfg.DirectHint, out peer, out peerDh))
+                        if (!Proto.PunchHole(sock, hs, peerPub, peerLocal, dhPub, connectTimeout, Cfg.DirectHint, out peer, out peerDh, out peerCaps))
                         {
                             U.Line("  Could not reach the receiver.");
                             U.Line("  Possible causes:");
@@ -2118,8 +2580,11 @@ namespace P2PShellV1
                 byte[] dhShared;
                 try { dhShared = DH.Shared(dhPriv, peerDh); }
                 catch (ArgumentException e) { U.Line("  Handshake error: " + e.Message); return 1; }
+                // Long codes learn the peer's AES support from its HELLO; only the
+                // HELLOs themselves used the SHA-256 cipher.
+                if (longCode) Cfg.ChooseCipher((Cfg.MyCaps() & Cfg.CapAes) != 0, (peerCaps & Cfg.CapAes) != 0, "receiver");
                 U.V("  Forward-secret session keys established (DH + PBKDF2).");
-                Cipher session = new Cipher(U.Cat(secret, dhShared), salt, true);
+                Cipher session = new Cipher(U.Cat(secret, dhShared), salt, true, Cfg.UseAes);
 
                 bool sent = Proto.SendFile(xfer, peer, session, filepath, filesize, filehash, connectTimeout);
                 if (!sent) return 1;
@@ -2135,8 +2600,8 @@ namespace P2PShellV1
 
         static int CmdRecv(int connectTimeout, string resumePath)
         {
-            UdpSock sock; IPEndPoint pub, local;
-            SetupEndpoints(out sock, out pub, out local);
+            UdpSock sock; IPEndPoint local;
+            BindUdp(out sock, out local);
             RelaySock relay = null;
             try
             {
@@ -2147,10 +2612,33 @@ namespace P2PShellV1
                 scode = scode.Trim();
                 if (scode.Length == 0) { U.Line("  No code entered."); return 1; }
 
+                bool longCode;
+                try
+                {
+                    string np; byte[] pw;
+                    longCode = !Pake.ParseCode(scode, out np, out pw);
+                }
+                catch (FormatException e)
+                {
+                    U.Line("  Error: invalid sender code.");
+                    U.Line("  " + e.Message + (e.Message.StartsWith("Unknown word") ? " (check the spelling)" : ""));
+                    return 1;
+                }
+
                 int nw = Codes.Split(scode).Length;
-                byte[] secret, salt;
-                IPEndPoint peerPub = null, peerLocal = null;
-                if (Cfg.UseRelay)
+                byte[] secret = null, salt = null;
+                IPEndPoint pub = null, peerPub = null, peerLocal = null;
+                if (!longCode)
+                {
+                    if (!Cfg.UseRelay && !Http.Reachable())    // RunInner already checked with --relay
+                    {
+                        U.Line("  Error: cannot reach the relay at " + Cfg.RelayHost + " to look up the code.");
+                        U.Line("  Check your internet connection, or point at another relay with --relay-host.");
+                        return 1;
+                    }
+                    PakeConnect(scode, false, sock, local, connectTimeout, out secret, out salt, out peerPub, out peerLocal);
+                }
+                else if (Cfg.UseRelay)
                 {
                     if (nw == 36 || nw == 55)
                     {
@@ -2172,6 +2660,7 @@ namespace P2PShellV1
                 }
                 else
                 {
+                    pub = Discover(sock, local);
                     if (nw == Cfg.RelayCodeWords)
                     {
                         U.Line("  Error: this is a relay code (the sender used --relay).");
@@ -2208,20 +2697,20 @@ namespace P2PShellV1
                 }
 
                 U.V("  Deriving handshake keys (PBKDF2, 100k rounds)...");
-                Cipher hs = new Cipher(secret, salt, false);
+                Cipher hs = new Cipher(secret, salt, false, Cfg.UseAes);
                 BigInteger dhPriv; byte[] dhPub;
                 DH.Keypair(out dhPriv, out dhPub);
 
-                IPEndPoint peer; byte[] peerDh;
+                IPEndPoint peer; byte[] peerDh; byte peerCaps;
                 IPktSock xfer;
                 try
                 {
                     if (Cfg.UseRelay)
                     {
-                        U.Line("  Relay mode: connecting through the relay (sender must also use --relay).");
+                        U.Line("  Relay mode: connecting through the relay" + (longCode ? " (sender must also use --relay)." : "."));
                         relay = new RelaySock(Codes.RelayToken(secret), "r2s", "s2r");
                         xfer = relay;
-                        if (!Proto.PunchHole(relay, hs, RelaySock.PeerAddr, RelaySock.PeerAddr, dhPub, connectTimeout, null, out peer, out peerDh))
+                        if (!Proto.PunchHole(relay, hs, RelaySock.PeerAddr, RelaySock.PeerAddr, dhPub, connectTimeout, null, out peer, out peerDh, out peerCaps))
                         {
                             U.Line("  Could not reach the sender through the relay.");
                             U.Line("  Possible causes:");
@@ -2234,7 +2723,7 @@ namespace P2PShellV1
                     else
                     {
                         xfer = sock;
-                        if (!Proto.PunchHole(sock, hs, peerPub, peerLocal, dhPub, connectTimeout, Cfg.DirectHint, out peer, out peerDh))
+                        if (!Proto.PunchHole(sock, hs, peerPub, peerLocal, dhPub, connectTimeout, Cfg.DirectHint, out peer, out peerDh, out peerCaps))
                         {
                             U.Line("  Could not reach the sender.");
                             U.Line("  Possible causes:");
@@ -2251,8 +2740,11 @@ namespace P2PShellV1
                 byte[] dhShared;
                 try { dhShared = DH.Shared(dhPriv, peerDh); }
                 catch (ArgumentException e) { U.Line("  Handshake error: " + e.Message); return 1; }
+                // Long codes learn the peer's AES support from its HELLO; only the
+                // HELLOs themselves used the SHA-256 cipher.
+                if (longCode) Cfg.ChooseCipher((Cfg.MyCaps() & Cfg.CapAes) != 0, (peerCaps & Cfg.CapAes) != 0, "sender");
                 U.V("  Forward-secret session keys established (DH + PBKDF2).");
-                Cipher session = new Cipher(U.Cat(secret, dhShared), salt, false);
+                Cipher session = new Cipher(U.Cat(secret, dhShared), salt, false, Cfg.UseAes);
 
                 Proto.RecvResult res = Proto.RecvFile(xfer, peer, session, connectTimeout, Cfg.MaxFileSize, resumePath);
                 if (res == null) return 1;
@@ -2293,7 +2785,7 @@ namespace P2PShellV1
 
 '@
 
-if (-not ('P2PShellV1.App' -as [type])) {
+if (-not ('P2PShellV2.App' -as [type])) {
     $addTypeArgs = @{
         TypeDefinition = $P2PEngineSource
         Language       = 'CSharp'
@@ -2325,5 +2817,5 @@ if (-not ('P2PShellV1.App' -as [type])) {
 [Environment]::CurrentDirectory = (Get-Location -PSProvider FileSystem).ProviderPath
 
 $argv = [string[]]@($args | ForEach-Object { "$_" })
-$code = [P2PShellV1.App]::Run($argv, $PSScriptRoot)
+$code = [P2PShellV2.App]::Run($argv, $PSScriptRoot)
 exit $code

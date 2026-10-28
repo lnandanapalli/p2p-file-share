@@ -4,6 +4,10 @@ Encrypted peer-to-peer file transfer over UDP hole punching. Single file, zero d
 
 Like Magic Wormhole, but you don't install anything.
 
+## In a browser: `web/`
+
+`web/` is a separate browser version for people who'd rather not use a terminal: open the page, pick a file, share a short code, and the file goes directly between the two browsers (WebRTC) or through the same relay, end-to-end encrypted. It doesn't interoperate with `p2p.py` / `p2p.ps1`. See [web/README.md](web/README.md) for how it works and how to deploy it.
+
 ## No Python? Use `p2p.ps1` (Windows)
 
 `p2p.ps1` is a drop-in PowerShell client that speaks exactly the same protocol, codes and relay format as `p2p.py`. Either side can be Python or PowerShell, in any combination, in direct or `--relay` mode, including `--resume`.

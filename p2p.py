@@ -157,7 +157,7 @@ RECV_BUF = 65536
 VERBOSE  = False
 USE_IPV6 = False
 USE_RELAY      = False   # --relay: skip hole punching, use the HTTPS relay only
-USE_AES        = False   # set when both sides can do AES-256 (short codes only)
+USE_AES        = False   # set when both sides can do AES-256
 
 
 def _vprint(*args, **kwargs):
@@ -588,6 +588,24 @@ def _aes_available() -> bool:
         _AES_LIB = None
     _vprint("  AES-256 not available here (OpenSSL not found); using the SHA-256 cipher.")
     return False
+
+
+_CAP_AES = 1   # HELLO capability bit: this side can do AES-256-CTR
+
+
+def _my_caps() -> int:
+    return _CAP_AES if _aes_available() else 0
+
+
+def _choose_cipher(mine: bool, theirs: bool, other: str):
+    """AES-256-CTR if both sides can, else the SHA-256 cipher. Prints which."""
+    global USE_AES
+    USE_AES = mine and theirs
+    if USE_AES:
+        print("  Encryption: AES-256-CTR + HMAC-SHA256.")
+    else:
+        where = "this machine" if not mine else f"the {other}'s machine"
+        print(f"  Encryption: SHA-256-CTR + HMAC-SHA256 (AES isn't available on {where}).")
 
 
 class _AesCtr:
@@ -1144,11 +1162,12 @@ def decode_recv_code(code, secret):
 
 
 def punch_hole(sock, cipher, pub_addr, local_addr, dh_pub_bytes,
-               timeout=CONNECT_TIMEOUT, hint=None):
+               timeout=CONNECT_TIMEOUT, hint=None, caps=0):
     """
-    Simultaneously send encrypted HELLOs (carrying our DH public key) to
-    the peer's public and local endpoints until one replies with theirs.
-    Returns (peer_addr, peer_dh_pub_bytes) or (None, None).
+    Simultaneously send encrypted HELLOs (carrying our DH public key and our
+    capability byte, see _CAP_*) to the peer's public and local endpoints
+    until one replies with theirs.
+    Returns (peer_addr, peer_dh_pub_bytes, peer_caps) or (None, None, None).
 
     Robustness measures
     -------------------
@@ -1177,7 +1196,7 @@ def punch_hole(sock, cipher, pub_addr, local_addr, dh_pub_bytes,
     # Flush stale packets before we start listening.
     _drain_socket(sock)
 
-    hello_payload = b"DH1:" + dh_pub_bytes
+    hello_payload = b"DH2:" + dh_pub_bytes + bytes([caps])
     hello_pkt     = cipher.encrypt(T_HELLO, hello_payload)
     start         = time.time()
 
@@ -1221,10 +1240,11 @@ def punch_hole(sock, cipher, pub_addr, local_addr, dh_pub_bytes,
             # --------------------------------------------------------------------
 
             ptype, payload = cipher.decrypt(data)
-            if ptype == T_HELLO and payload and payload[:4] == b"DH1:":
-                peer_dh_pub = payload[4:]
-                if len(peer_dh_pub) != _DH_KEY_BYTES:
+            if ptype == T_HELLO and payload and payload[:4] == b"DH2:":
+                if len(payload) != 4 + _DH_KEY_BYTES + 1:
                     continue   # malformed -- ignore
+                peer_dh_pub = payload[4:4 + _DH_KEY_BYTES]
+                peer_caps   = payload[-1]
                 # Confirm the path with a few extra HELLOs
                 addr_full = _addr_tuple(*addr)
                 for _ in range(5):
@@ -1237,7 +1257,7 @@ def punch_hole(sock, cipher, pub_addr, local_addr, dh_pub_bytes,
                     print(f"\n  Connected to {_fmt_addr(*addr)}")
                 else:
                     print("\n  Connected.")
-                return addr_full, peer_dh_pub
+                return addr_full, peer_dh_pub, peer_caps
             # Any other packet type here (e.g. T_META from a racing sender)
             # is silently ignored; punch_hole only cares about HELLOs.
 
@@ -1255,7 +1275,7 @@ def punch_hole(sock, cipher, pub_addr, local_addr, dh_pub_bytes,
         print("\n  Hole punch timed out.")
     else:
         print("\n  Connection timed out.")
-    return None, None
+    return None, None, None
 
 
 # ===============================================================================
@@ -2703,7 +2723,6 @@ def _pake_connect(code, is_sender, sock, local_ip, local_port, connect_timeout):
     relay mode. Exits on failure.
     """
     nameplate, password = parse_pake_code(code)
-    global USE_AES
     my_flags = ((_PAKE_F_RELAY if USE_RELAY else 0) | (_PAKE_F_IPV6 if USE_IPV6 else 0)
                 | (_PAKE_F_AES if _aes_available() else 0))
     other = "receiver" if is_sender else "sender"
@@ -2726,12 +2745,8 @@ def _pake_connect(code, is_sender, sock, local_ip, local_port, connect_timeout):
             sock.close()
             sys.exit(1)
         print("  Code verified.")
-        USE_AES = bool(my_flags & peer_flags & _PAKE_F_AES)
-        if USE_AES:
-            print("  Encryption: AES-256-CTR + HMAC-SHA256.")
-        else:
-            where = "this machine" if not my_flags & _PAKE_F_AES else f"the {other}'s machine"
-            print(f"  Encryption: SHA-256-CTR + HMAC-SHA256 (AES isn't available on {where}).")
+        # Short codes pick the cipher here, so even the HELLOs below use it.
+        _choose_cipher(bool(my_flags & _PAKE_F_AES), bool(peer_flags & _PAKE_F_AES), other)
 
         if (my_flags | peer_flags) & _PAKE_F_RELAY:
             if not USE_RELAY:
@@ -2889,10 +2904,10 @@ def cmd_send(filepath, connect_timeout=CONNECT_TIMEOUT, long_code=False):
         token = _relay_session_token(secret)
         relay_sock = RelaySocket(RELAY_HOST, token, send_dir="s2r", recv_dir="r2s")
         try:
-            peer, peer_dh_pub = punch_hole(
+            peer, peer_dh_pub, peer_caps = punch_hole(
                 relay_sock, handshake_cipher,
                 RelaySocket.PEER_ADDR, RelaySocket.PEER_ADDR,
-                dh_pub, timeout=connect_timeout,
+                dh_pub, timeout=connect_timeout, caps=_my_caps(),
             )
         except KeyboardInterrupt:
             print("\n  Cancelled during connection.")
@@ -2911,7 +2926,7 @@ def cmd_send(filepath, connect_timeout=CONNECT_TIMEOUT, long_code=False):
             sys.exit(1)
     else:
         try:
-            peer, peer_dh_pub = punch_hole(
+            peer, peer_dh_pub, peer_caps = punch_hole(
                 sock,
                 handshake_cipher,
                 (peer_pub_ip, peer_pub_port),
@@ -2919,6 +2934,7 @@ def cmd_send(filepath, connect_timeout=CONNECT_TIMEOUT, long_code=False):
                 dh_pub,
                 timeout=connect_timeout,
                 hint=_DIRECT_HINT,
+                caps=_my_caps(),
             )
         except KeyboardInterrupt:
             print("\n  Cancelled during connection.")
@@ -2944,6 +2960,10 @@ def cmd_send(filepath, connect_timeout=CONNECT_TIMEOUT, long_code=False):
         sock.close()
         sys.exit(1)
 
+    if long_code:
+        # Long codes learn the peer's AES support from its HELLO; only the
+        # HELLOs themselves used the SHA-256 cipher.
+        _choose_cipher(bool(_my_caps() & _CAP_AES), bool(peer_caps & _CAP_AES), "receiver")
     _vprint("  Forward-secret session keys established (DH + PBKDF2).")
     session_cipher = Cipher(secret + dh_shared, salt, is_sender=True, aes=USE_AES)
 
@@ -3077,10 +3097,10 @@ def cmd_recv(connect_timeout=CONNECT_TIMEOUT, max_size=MAX_FILE_SIZE, resume_pat
         token = _relay_session_token(secret)
         relay_sock = RelaySocket(RELAY_HOST, token, send_dir="r2s", recv_dir="s2r")
         try:
-            peer, peer_dh_pub = punch_hole(
+            peer, peer_dh_pub, peer_caps = punch_hole(
                 relay_sock, handshake_cipher,
                 RelaySocket.PEER_ADDR, RelaySocket.PEER_ADDR,
-                dh_pub, timeout=connect_timeout,
+                dh_pub, timeout=connect_timeout, caps=_my_caps(),
             )
         except KeyboardInterrupt:
             print("\n  Cancelled during connection.")
@@ -3099,7 +3119,7 @@ def cmd_recv(connect_timeout=CONNECT_TIMEOUT, max_size=MAX_FILE_SIZE, resume_pat
             sys.exit(1)
     else:
         try:
-            peer, peer_dh_pub = punch_hole(
+            peer, peer_dh_pub, peer_caps = punch_hole(
                 sock,
                 handshake_cipher,
                 (peer_pub_ip, peer_pub_port),
@@ -3107,6 +3127,7 @@ def cmd_recv(connect_timeout=CONNECT_TIMEOUT, max_size=MAX_FILE_SIZE, resume_pat
                 dh_pub,
                 timeout=connect_timeout,
                 hint=_DIRECT_HINT,
+                caps=_my_caps(),
             )
         except KeyboardInterrupt:
             print("\n  Cancelled during connection.")
@@ -3132,6 +3153,10 @@ def cmd_recv(connect_timeout=CONNECT_TIMEOUT, max_size=MAX_FILE_SIZE, resume_pat
         sock.close()
         sys.exit(1)
 
+    if long_code:
+        # Long codes learn the peer's AES support from its HELLO; only the
+        # HELLOs themselves used the SHA-256 cipher.
+        _choose_cipher(bool(_my_caps() & _CAP_AES), bool(peer_caps & _CAP_AES), "sender")
     _vprint("  Forward-secret session keys established (DH + PBKDF2).")
     session_cipher = Cipher(secret + dh_shared, salt, is_sender=False, aes=USE_AES)
 

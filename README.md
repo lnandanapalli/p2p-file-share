@@ -23,7 +23,7 @@ powershell -ExecutionPolicy Bypass -File .\p2p.ps1 recv --relay
 
 Under the hood the transfer engine is C# embedded in the script, compiled in memory by PowerShell's built-in `Add-Type` on first run (a second or two). Plain PowerShell loops would be far too slow for per-packet crypto. Machines locked down by AppLocker / Device Guard (PowerShell "Constrained Language" mode) block `Add-Type`; the script detects that and says so.
 
-**Both machines need matching versions**: relay mode now uses 32 KB chunks, and a mismatched peer is refused up front with a clear message instead of producing a corrupted file. Short codes (`4821-apple-river-ocean`) also need the current version on both sides; an older peer can still be reached with `send --long-code`.
+**Both machines need matching versions**: relay mode now uses 32 KB chunks, and a mismatched peer is refused up front with a clear message instead of producing a corrupted file. This applies to every mode, including short codes and `--long-code`: always run the same version of `p2p.py` / `p2p.ps1` on both machines.
 
 To rebuild `p2p.ps1` after editing the engine: `python build/build.py` (it embeds `build/engine.cs` and the word list from `p2p.py`).
 
@@ -151,14 +151,14 @@ If both peers are on the same LAN, it will connect via local addresses regardles
 
 ## Crypto
 
-> **Warning:** When AES isn't available on both sides (and always with `--long-code`), the encryption uses a non-standard construction built from `hashlib` and `hmac` for zero-dependency portability. It has not been independently audited. Do not use this for high-stakes or life-safety transfers. For those, use other tools of your choice. This only helps when you have a low-stakes scenario but cannot install anything on the machine. You should also have Python on the machine. You could also manually encrypt using some other tool before sending which adds an additional layer of security.
+> **Warning:** When AES isn't available on both sides, the encryption uses a non-standard construction built from `hashlib` and `hmac` for zero-dependency portability. It has not been independently audited. Do not use this for high-stakes or life-safety transfers. For those, use other tools of your choice. This only helps when you have a low-stakes scenario but cannot install anything on the machine. You should also have Python on the machine. You could also manually encrypt using some other tool before sending which adds an additional layer of security.
 
 What it does:
 
 - **Short codes:** SPAKE2 ([RFC 9382](https://www.rfc-editor.org/rfc/rfc9382)) in the RFC 3526 Group 14 prime-order subgroup, with explicit key confirmation. M and N are hashed into the group, so nobody knows their discrete logs. The relay mailbox ID is derived from the number only, never from the words.
 - **Key derivation:** PBKDF2-HMAC-SHA256, 100k rounds, salt derived from the SPAKE2 key (random with `--long-code`)
 - **Key exchange:** Ephemeral Diffie-Hellman (RFC 3526 Group 14, 2048-bit MODP) for forward secrecy
-- **Encryption:** AES-256 in counter mode when both sides can do it, otherwise SHA-256 in counter mode as a stream cipher (keystream blocks via `SHA-256(key || nonce || counter)`, XORed with plaintext). Python has no AES in its standard library, so `p2p.py` borrows it from the OpenSSL library that Python's own `ssl` module ships with (via `ctypes`, still nothing to install) and checks it against a NIST test vector first; `p2p.ps1` uses .NET's built-in AES. The two sides agree on the cipher while verifying the short code, and each prints which one is in use. `--long-code` transfers always use the SHA-256 cipher, so they stay compatible with older versions.
+- **Encryption:** AES-256 in counter mode when both sides can do it, otherwise SHA-256 in counter mode as a stream cipher (keystream blocks via `SHA-256(key || nonce || counter)`, XORed with plaintext). Python has no AES in its standard library, so `p2p.py` borrows it from the OpenSSL library that Python's own `ssl` module ships with (via `ctypes`, still nothing to install) and checks it against a NIST test vector first; `p2p.ps1` uses .NET's built-in AES. The two sides agree on the cipher before any file data is sent (while verifying a short code, or in the connection handshake with `--long-code`), and each prints which one is in use.
 - **Authentication:** HMAC-SHA256 truncated to 128 bits, per packet
 - **Integrity:** SHA-256 hash of the entire file, verified on receive
 - **Replay protection:** Sliding-window nonce tracking

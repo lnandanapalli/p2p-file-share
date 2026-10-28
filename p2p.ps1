@@ -98,7 +98,19 @@ namespace P2PShellV2
                           T_DONEACK = 6, T_ABORT = 7, T_HASHQ = 8, T_HASHR = 9;
 
         public static bool Verbose, UseIPv6, UseRelay;
-        public static bool UseAes;     // set when both sides can do AES-256 (short codes only)
+        public static bool UseAes;     // set when both sides can do AES-256
+        public const byte CapAes = 1;  // HELLO capability bit: this side can do AES-256-CTR
+
+        public static byte MyCaps() { return AesCtr.Available ? CapAes : (byte)0; }
+
+        // AES-256-CTR if both sides can, else the SHA-256 cipher. Prints which.
+        public static void ChooseCipher(bool mine, bool theirs, string other)
+        {
+            UseAes = mine && theirs;
+            if (UseAes) U.Line("  Encryption: AES-256-CTR + HMAC-SHA256.");
+            else U.Line("  Encryption: SHA-256-CTR + HMAC-SHA256 (AES isn't available on " +
+                        (!mine ? "this machine" : "the " + other + "'s machine") + ").");
+        }
 
         public const string DirectHint =
             "\n  Taking a while. If this keeps failing (strict NAT, CG-NAT, VM networking),\n" +
@@ -1470,15 +1482,15 @@ namespace P2PShellV2
 
         public static bool PunchHole(IPktSock sock, Cipher c, IPEndPoint pub, IPEndPoint local,
                                      byte[] dhPub, double timeout, string hint,
-                                     out IPEndPoint peer, out byte[] peerDhPub)
+                                     out IPEndPoint peer, out byte[] peerDhPub, out byte peerCaps)
         {
-            peer = null; peerDhPub = null;
+            peer = null; peerDhPub = null; peerCaps = 0;
             List<IPEndPoint> targets = new List<IPEndPoint>();
             targets.Add(pub);
             if (local != null && !Net.SameAddr(local, pub)) targets.Add(local);
 
             Drain(sock);
-            byte[] hello = c.Encrypt(Cfg.T_HELLO, U.Cat(Encoding.ASCII.GetBytes("DH1:"), dhPub));
+            byte[] hello = c.Encrypt(Cfg.T_HELLO, U.Cat(Encoding.ASCII.GetBytes("DH2:"), dhPub, new byte[] { Cfg.MyCaps() }));
             double start = U.Now();
             string status = Cfg.Verbose ? "Punching through NAT..." : "Connecting...";
             U.Out("  " + status);
@@ -1499,10 +1511,11 @@ namespace P2PShellV2
                     if (match == null) continue;
                     byte pt; byte[] pl;
                     if (!c.Decrypt(data, out pt, out pl)) continue;
-                    if (pt == Cfg.T_HELLO && pl.Length >= 4 && pl[0] == 'D' && pl[1] == 'H' && pl[2] == '1' && pl[3] == ':')
+                    if (pt == Cfg.T_HELLO && pl.Length >= 4 && pl[0] == 'D' && pl[1] == 'H' && pl[2] == '2' && pl[3] == ':')
                     {
-                        if (pl.Length - 4 != DH.KeyBytes) continue;
+                        if (pl.Length != 4 + DH.KeyBytes + 1) continue;
                         peerDhPub = U.Slice(pl, 4, DH.KeyBytes);
+                        peerCaps = pl[pl.Length - 1];
                         for (int i = 0; i < 5; i++) { sock.SendTo(hello, from); Thread.Sleep(50); }
                         if (Cfg.Verbose) U.Line("\n  Connected to " + Net.FmtAddr(from));
                         else U.Line("\n  Connected.");
@@ -2401,10 +2414,8 @@ namespace P2PShellV2
                 }
                 if (peerFlags < 0) { U.Line("  Timed out: the " + other + " never showed up."); throw new ExitException(1); }
                 U.Line("  Code verified.");
-                Cfg.UseAes = (myFlags & peerFlags & Pake.FAes) != 0;
-                if (Cfg.UseAes) U.Line("  Encryption: AES-256-CTR + HMAC-SHA256.");
-                else U.Line("  Encryption: SHA-256-CTR + HMAC-SHA256 (AES isn't available on " +
-                            ((myFlags & Pake.FAes) == 0 ? "this machine" : "the " + other + "'s machine") + ").");
+                // Short codes pick the cipher here, so even the HELLOs use it.
+                Cfg.ChooseCipher((myFlags & Pake.FAes) != 0, (peerFlags & Pake.FAes) != 0, other);
 
                 if (((myFlags | peerFlags) & Pake.FRelay) != 0)
                 {
@@ -2530,7 +2541,7 @@ namespace P2PShellV2
                 BigInteger dhPriv; byte[] dhPub;
                 DH.Keypair(out dhPriv, out dhPub);
 
-                IPEndPoint peer; byte[] peerDh;
+                IPEndPoint peer; byte[] peerDh; byte peerCaps;
                 IPktSock xfer;
                 try
                 {
@@ -2539,7 +2550,7 @@ namespace P2PShellV2
                         U.Line("  Relay mode: connecting through the relay" + (longCode ? " (receiver must also use --relay)." : "."));
                         relay = new RelaySock(Codes.RelayToken(secret), "s2r", "r2s");
                         xfer = relay;
-                        if (!Proto.PunchHole(relay, hs, RelaySock.PeerAddr, RelaySock.PeerAddr, dhPub, connectTimeout, null, out peer, out peerDh))
+                        if (!Proto.PunchHole(relay, hs, RelaySock.PeerAddr, RelaySock.PeerAddr, dhPub, connectTimeout, null, out peer, out peerDh, out peerCaps))
                         {
                             U.Line("  Could not reach the receiver through the relay.");
                             U.Line("  Possible causes:");
@@ -2552,7 +2563,7 @@ namespace P2PShellV2
                     else
                     {
                         xfer = sock;
-                        if (!Proto.PunchHole(sock, hs, peerPub, peerLocal, dhPub, connectTimeout, Cfg.DirectHint, out peer, out peerDh))
+                        if (!Proto.PunchHole(sock, hs, peerPub, peerLocal, dhPub, connectTimeout, Cfg.DirectHint, out peer, out peerDh, out peerCaps))
                         {
                             U.Line("  Could not reach the receiver.");
                             U.Line("  Possible causes:");
@@ -2569,6 +2580,9 @@ namespace P2PShellV2
                 byte[] dhShared;
                 try { dhShared = DH.Shared(dhPriv, peerDh); }
                 catch (ArgumentException e) { U.Line("  Handshake error: " + e.Message); return 1; }
+                // Long codes learn the peer's AES support from its HELLO; only the
+                // HELLOs themselves used the SHA-256 cipher.
+                if (longCode) Cfg.ChooseCipher((Cfg.MyCaps() & Cfg.CapAes) != 0, (peerCaps & Cfg.CapAes) != 0, "receiver");
                 U.V("  Forward-secret session keys established (DH + PBKDF2).");
                 Cipher session = new Cipher(U.Cat(secret, dhShared), salt, true, Cfg.UseAes);
 
@@ -2687,7 +2701,7 @@ namespace P2PShellV2
                 BigInteger dhPriv; byte[] dhPub;
                 DH.Keypair(out dhPriv, out dhPub);
 
-                IPEndPoint peer; byte[] peerDh;
+                IPEndPoint peer; byte[] peerDh; byte peerCaps;
                 IPktSock xfer;
                 try
                 {
@@ -2696,7 +2710,7 @@ namespace P2PShellV2
                         U.Line("  Relay mode: connecting through the relay" + (longCode ? " (sender must also use --relay)." : "."));
                         relay = new RelaySock(Codes.RelayToken(secret), "r2s", "s2r");
                         xfer = relay;
-                        if (!Proto.PunchHole(relay, hs, RelaySock.PeerAddr, RelaySock.PeerAddr, dhPub, connectTimeout, null, out peer, out peerDh))
+                        if (!Proto.PunchHole(relay, hs, RelaySock.PeerAddr, RelaySock.PeerAddr, dhPub, connectTimeout, null, out peer, out peerDh, out peerCaps))
                         {
                             U.Line("  Could not reach the sender through the relay.");
                             U.Line("  Possible causes:");
@@ -2709,7 +2723,7 @@ namespace P2PShellV2
                     else
                     {
                         xfer = sock;
-                        if (!Proto.PunchHole(sock, hs, peerPub, peerLocal, dhPub, connectTimeout, Cfg.DirectHint, out peer, out peerDh))
+                        if (!Proto.PunchHole(sock, hs, peerPub, peerLocal, dhPub, connectTimeout, Cfg.DirectHint, out peer, out peerDh, out peerCaps))
                         {
                             U.Line("  Could not reach the sender.");
                             U.Line("  Possible causes:");
@@ -2726,6 +2740,9 @@ namespace P2PShellV2
                 byte[] dhShared;
                 try { dhShared = DH.Shared(dhPriv, peerDh); }
                 catch (ArgumentException e) { U.Line("  Handshake error: " + e.Message); return 1; }
+                // Long codes learn the peer's AES support from its HELLO; only the
+                // HELLOs themselves used the SHA-256 cipher.
+                if (longCode) Cfg.ChooseCipher((Cfg.MyCaps() & Cfg.CapAes) != 0, (peerCaps & Cfg.CapAes) != 0, "sender");
                 U.V("  Forward-secret session keys established (DH + PBKDF2).");
                 Cipher session = new Cipher(U.Cat(secret, dhShared), salt, false, Cfg.UseAes);
 

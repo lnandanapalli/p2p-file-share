@@ -408,6 +408,52 @@ func encodeBatch(packets [][]byte) []byte {
 	return out
 }
 
+// ---- CORS (browser client) ----
+// The browser client (web/) is served from its own origin and calls the
+// relay with fetch(), so the relay must allow that origin. Only origins in
+// RELAY_ALLOWED_ORIGINS (comma-separated) get CORS headers; the CLI clients
+// don't send an Origin header and are unaffected. CORS is not access
+// control here (any non-browser client can call the relay anyway); it only
+// stops other websites from using visitors' browsers against it.
+
+const defaultAllowedOrigins = "https://share.nlpdf.site"
+
+var allowedOrigins = parseOrigins(os.Getenv("RELAY_ALLOWED_ORIGINS"))
+
+func parseOrigins(v string) map[string]bool {
+	if strings.TrimSpace(v) == "" {
+		v = defaultAllowedOrigins
+	}
+	m := map[string]bool{}
+	for _, o := range strings.Split(v, ",") {
+		if o = strings.TrimRight(strings.TrimSpace(o), "/"); o != "" {
+			m[o] = true
+		}
+	}
+	return m
+}
+
+// cors sets CORS headers for allowed origins. It reports true if the
+// request was a preflight, which it has fully answered.
+func cors(w http.ResponseWriter, r *http.Request) bool {
+	h := w.Header()
+	h.Add("Vary", "Origin")
+	origin := r.Header.Get("Origin")
+	if origin == "" || !allowedOrigins[origin] {
+		return false
+	}
+	h.Set("Access-Control-Allow-Origin", origin)
+	h.Set("Access-Control-Expose-Headers", "Retry-After")
+	if r.Method != http.MethodOptions {
+		return false
+	}
+	h.Set("Access-Control-Allow-Methods", "GET, POST")
+	h.Set("Access-Control-Allow-Headers", "Content-Type")
+	h.Set("Access-Control-Max-Age", "86400")
+	w.WriteHeader(http.StatusNoContent)
+	return true
+}
+
 // ---- routing ----
 // Path shape: /relay/{token}/{dir}/{send|recv}
 // dir is "s2r" or "r2s" — fixed strings each peer already knows locally
@@ -432,6 +478,9 @@ func pickDirection(s *session, dir string) *direction {
 }
 
 func relayHandler(w http.ResponseWriter, r *http.Request) {
+	if cors(w, r) {
+		return // preflight: no session state touched
+	}
 	ip := clientIP(r)
 	windowReqs.Add(1)
 	if ip == unknownKey {
@@ -577,6 +626,9 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/relay/", relayHandler)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		if cors(w, r) {
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 	})
 
@@ -593,6 +645,10 @@ func main() {
 		// are enforced in handleRecv itself.
 	}
 
-	log.Printf("relay listening on %s", addr)
+	origins := make([]string, 0, len(allowedOrigins))
+	for o := range allowedOrigins {
+		origins = append(origins, o)
+	}
+	log.Printf("relay listening on %s (browser origins allowed: %s)", addr, strings.Join(origins, ", "))
 	log.Fatal(srv.ListenAndServe())
 }

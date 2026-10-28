@@ -8,7 +8,7 @@ Symmetric NATs may fail direct hole punching -- that's a hard networking limit.
 For those networks, run both sides with --relay to go through an HTTPS relay.
 
 Usage:
-    python p2p.py send <file> [-6] [--relay] [--connect-timeout SECONDS] [--verbose]
+    python p2p.py send <file> [-6] [--relay] [--long-code] [--connect-timeout SECONDS] [--verbose]
     python p2p.py recv        [-6] [--relay] [--connect-timeout SECONDS] [--resume PARTIAL_FILE] [--verbose]
 
   --connect-timeout controls how long (in seconds) both sides will wait
@@ -18,22 +18,27 @@ Usage:
   --verbose shows technical connection details such as IP addresses and
   handshake/STUN status.
 
-Flow:
-    1. Sender runs 'send', gets a SEND CODE.
-    2. Sender shares the code out-of-band (chat, email, etc.).
-    3. Receiver runs 'recv', pastes the send code, gets a RECV CODE.
-    4. Receiver shares the recv code back to the sender.
-    5. Sender pastes the recv code.
-    6. Both sides punch through NAT.
-    7. Receiver sees file name and size, then accepts or declines.
-    8. If accepted, the encrypted transfer begins.
+Flow (default, short codes):
+    1. Sender runs 'send', gets a short code like 4821-apple-river-ocean.
+    2. Sender shares the code out-of-band (chat, phone call, etc.).
+    3. Receiver runs 'recv' and types the code.
+    4. Both sides meet at the relay mailbox picked by the number, prove they
+       know the same words with SPAKE2 (a PAKE), and swap their addresses
+       encrypted under the resulting key.
+    5. Both sides punch through NAT; the file goes directly peer-to-peer.
+       (With --relay on either side, the file goes through the relay instead.)
+    6. Receiver sees file name and size, then accepts or declines.
+    7. If accepted, the encrypted transfer begins.
 
-  With --relay (both sides) the flow is shorter: the sender gets one short
-  code (13 words), shares it, and waits at the relay; the receiver pastes it
-  and connects. There is no recv code and no hole punching.
+  With 'send --long-code' the old flow is used instead: a long send code
+  that carries the addresses, and a long recv code pasted back. In direct
+  mode that never contacts the relay. With --long-code --relay (both sides)
+  there is one 13-word code and no recv code.
 
 Crypto:
-    - 128-bit random secret (embedded in the send code)
+    - Short codes: SPAKE2 (RFC 9382) over RFC 3526 Group 14 turns the
+      30-bit code words into a strong key; one online guess per code
+    - Long codes: 128-bit random secret (embedded in the send code)
     - PBKDF2-HMAC-SHA256 key derivation (random salt) -> separate keys per direction
     - Ephemeral Diffie-Hellman (RFC 3526 Group 14) for forward secrecy
     - SHA-256 in CTR mode as a stream cipher (XOR keystream)
@@ -1425,6 +1430,254 @@ class RelaySocket:
 
 
 # ===============================================================================
+# Short codes: SPAKE2 password-authenticated key exchange  (the default)
+# ===============================================================================
+#
+# The sender gets a short code such as "4821-apple-river-ocean":
+#   - The number is a "nameplate". It only picks a mailbox on the relay so
+#     both sides meet in the same place; it is not secret.
+#   - The words are a short password (30 bits). SPAKE2 turns it into a strong
+#     shared key. Someone watching (or running) the relay cannot brute-force
+#     it offline, and an active attacker gets exactly one guess per code: a
+#     wrong guess aborts the transfer on both sides.
+#
+# Both sides meet at the relay mailbox, run SPAKE2 and agree on the mode
+# (relay if EITHER side asked for --relay). In direct mode they then swap
+# their STUN addresses, encrypted under the new key, and leave the relay:
+# the file itself still goes peer-to-peer over UDP. The key from SPAKE2 then
+# takes the place of the long codes' secret; everything after that (DH HELLO,
+# per-packet crypto, transfer, resume) is unchanged.
+#
+# SPAKE2 (RFC 9382) runs in the same RFC 3526 group 14 as the DH above. p is
+# a safe prime and 2 generates the subgroup of prime order q = (p-1)/2. M and
+# N are hashed into that subgroup (hash, then square), so nobody knows their
+# discrete logs.
+
+PAKE_WORDS     = 3      # password words in a short code (10 bits each)
+PAKE_RESEND    = 5.0    # seconds between rendezvous resends (the relay rarely drops)
+PAKE_REPLY_GAP = 1.0    # seconds; min gap between replies to a peer's repeats
+_PAKE_VERSION  = 1
+_PAKE_F_RELAY  = 1      # flag: this side asked for --relay
+_PAKE_F_IPV6   = 2      # flag: this side uses -6
+_PAKE_MAGIC    = b"SPK1"
+
+_SPAKE_Q = (_DH_P - 1) // 2
+
+
+def _spake_hash_to_group(label: bytes) -> int:
+    out, ctr = b"", 0
+    while len(out) < _DH_KEY_BYTES + 32:          # extra bytes: negligible mod-p bias
+        out += hashlib.sha256(label + ctr.to_bytes(4, "big")).digest()
+        ctr += 1
+    return pow(int.from_bytes(out, "big") % _DH_P, 2, _DH_P)
+
+
+_SPAKE_M = _spake_hash_to_group(b"p2p-spake2-M-v1")
+_SPAKE_N = _spake_hash_to_group(b"p2p-spake2-N-v1")
+
+
+class PakeMismatch(Exception):
+    """The peer's confirmation didn't verify: the codes differ."""
+
+
+def make_pake_code() -> str:
+    nameplate = str(secrets.randbelow(9000) + 1000)
+    words = [_WORDLIST[secrets.randbelow(len(_WORDLIST))] for _ in range(PAKE_WORDS)]
+    return "-".join([nameplate] + words)
+
+
+def parse_pake_code(code: str):
+    """
+    "4821-apple-river-ocean" (dashes or spaces, any case) ->
+    (nameplate, password_bytes). Returns None if this isn't a short code at
+    all (so the caller can try the long formats). Raises ValueError if it
+    looks like a short code but is malformed.
+    """
+    parts = code.strip().lower().replace("-", " ").split()
+    if not parts or not all(c in "0123456789" for c in parts[0]):
+        return None
+    if len(parts[0]) > 6 or len(parts) != 1 + PAKE_WORDS:
+        raise ValueError(f"A short code is a number and {PAKE_WORDS} words, "
+                         f"like 4821-apple-river-ocean.")
+    for w in parts[1:]:
+        if w not in _WORD_INDEX:
+            raise ValueError(f"Unknown word: {w!r}")
+    nameplate = str(int(parts[0]))
+    return nameplate, "-".join([nameplate] + parts[1:]).encode()
+
+
+def _pake_token(nameplate: str) -> str:
+    # Derived from the nameplate only: the relay must never see anything
+    # derived from the password, or it could test guesses offline.
+    return hashlib.sha256(b"p2p-pake-nameplate-v1:" + nameplate.encode()).hexdigest()[:32]
+
+
+def _pake_salt(secret: bytes) -> bytes:
+    return _hmac.new(secret, b"p2p-pake-salt-v1", hashlib.sha256).digest()[:16]
+
+
+class Spake2:
+    """One side of SPAKE2. The sender plays A (uses M), the receiver B (uses N)."""
+
+    def __init__(self, password: bytes, is_sender: bool):
+        h = _hmac.new(b"p2p-spake2-pw-v1", password, hashlib.sha512).digest()
+        self._w = int.from_bytes(h, "big") % (_SPAKE_Q - 1) + 1
+        self._x = secrets.randbelow(_SPAKE_Q - 1) + 1
+        self._is_sender = is_sender
+        mine, self._theirs = (_SPAKE_M, _SPAKE_N) if is_sender else (_SPAKE_N, _SPAKE_M)
+        elem = pow(_DH_G, self._x, _DH_P) * pow(mine, self._w, _DH_P) % _DH_P
+        self.msg = elem.to_bytes(_DH_KEY_BYTES, "big")
+
+    def finish(self, peer_msg: bytes) -> bytes:
+        """Returns the 32-byte transcript hash. Raises ValueError on a bad element."""
+        if len(peer_msg) != _DH_KEY_BYTES:
+            raise ValueError("bad SPAKE2 element length")
+        y = int.from_bytes(peer_msg, "big")
+        if not 1 < y < _DH_P - 1 or pow(y, _SPAKE_Q, _DH_P) != 1:
+            raise ValueError("SPAKE2 element not in the group")
+        # Strip the peer's password mask (theirs^-w = theirs^(q-w)), then DH.
+        unmasked = y * pow(self._theirs, _SPAKE_Q - self._w, _DH_P) % _DH_P
+        k = pow(unmasked, self._x, _DH_P)
+        t, s = (self.msg, peer_msg) if self._is_sender else (peer_msg, self.msg)
+        tt = b""
+        for part in (b"p2p-sender", b"p2p-receiver", t, s,
+                     k.to_bytes(_DH_KEY_BYTES, "big"),
+                     self._w.to_bytes(_DH_KEY_BYTES, "big")):
+            tt += struct.pack(">Q", len(part)) + part
+        return hashlib.sha256(tt).digest()
+
+
+def _pake_seal(key, kind: bytes, payload: bytes) -> bytes:
+    """Encrypt-then-MAC one rendezvous message. Each (key, kind) pair is used
+    for exactly one plaintext, so a fixed nonce per kind is safe."""
+    ek, mk = key
+    ct = Cipher._xor(payload, Cipher._keystream(ek, kind * 8, len(payload)))
+    return _PAKE_MAGIC + kind + ct + _hmac.new(mk, kind + ct, hashlib.sha256).digest()
+
+
+def _pake_open(key, kind: bytes, body: bytes):
+    ek, mk = key
+    if len(body) < 32:
+        return None
+    ct, tag = body[:-32], body[-32:]
+    if not _hmac.compare_digest(tag, _hmac.new(mk, kind + ct, hashlib.sha256).digest()):
+        return None
+    return Cipher._xor(ct, Cipher._keystream(ek, kind * 8, len(ct)))
+
+
+class PakeSession:
+    """SPAKE2 + small authenticated messages over the relay mailbox."""
+
+    def __init__(self, nameplate: str, password: bytes, is_sender: bool):
+        self._is_sender = is_sender
+        self._spake = Spake2(password, is_sender)
+        self._elem_pkt = _PAKE_MAGIC + b"E" + self._spake.msg
+        self._conf_pkt = None
+        self._mine = self._theirs = None
+        self.secret = None
+        send_dir, recv_dir = ("s2r", "r2s") if is_sender else ("r2s", "s2r")
+        self.sock = RelaySocket(RELAY_HOST, _pake_token(nameplate), send_dir, recv_dir)
+
+    def close(self):
+        self.sock.close()
+
+    def _send(self, *pkts):
+        for p in pkts:
+            if p is not None:
+                self.sock.sendto(p, RelaySocket.PEER_ADDR)
+
+    def _recv(self, timeout):
+        """One rendezvous packet as (kind, body), or None."""
+        try:
+            if not select.select([self.sock], [], [], timeout)[0]:
+                return None
+            pkt, _ = self.sock.recvfrom(RECV_BUF)
+        except OSError:
+            return None
+        if len(pkt) < 5 or pkt[:4] != _PAKE_MAGIC:
+            return None
+        return pkt[4:5], pkt[5:]
+
+    def handshake(self, my_flags: int, timeout, status, hint=None):
+        """
+        Run SPAKE2 and key confirmation. Returns the peer's flags, or None
+        on timeout. Raises PakeMismatch if the codes differ.
+        """
+        info  = bytes([_PAKE_VERSION, my_flags])
+        start = time.time()
+        last_send = last_reply = start
+        last_shown = -1
+        hint_shown = False
+        self._send(self._elem_pkt)
+        while time.time() - start < timeout:
+            now = time.time()
+            if now - last_send >= PAKE_RESEND:
+                self._send(self._elem_pkt, self._conf_pkt)
+                last_send = now
+            elapsed = int(now - start)
+            if elapsed != last_shown:
+                last_shown = elapsed
+                if hint and not hint_shown and elapsed >= DIRECT_HINT_AFTER:
+                    hint_shown = True
+                    sys.stdout.write("\n" + hint + "\n")
+                sys.stdout.write(f"\r  {status} {elapsed // 60}m {elapsed % 60}s  " if elapsed >= 60
+                                 else f"\r  {status} {elapsed}s  ")
+                sys.stdout.flush()
+
+            got = self._recv(0.25)
+            if got is None:
+                continue
+            kind, body = got
+            if kind == b"E":
+                if self.secret is None:
+                    try:
+                        h = self._spake.finish(body)
+                    except ValueError:
+                        continue
+                    kdf = lambda label: _hmac.new(h, label, hashlib.sha256).digest()
+                    s2r = (kdf(b"p2p-pake-enc-s2r"), kdf(b"p2p-pake-mac-s2r"))
+                    r2s = (kdf(b"p2p-pake-enc-r2s"), kdf(b"p2p-pake-mac-r2s"))
+                    self._mine, self._theirs = (s2r, r2s) if self._is_sender else (r2s, s2r)
+                    self.secret = kdf(b"p2p-pake-session")
+                    self._conf_pkt = _pake_seal(self._mine, b"C", info)
+                    self._send(self._elem_pkt, self._conf_pkt)
+                    last_send = last_reply = now
+                elif now - last_reply >= PAKE_REPLY_GAP:
+                    # The peer is still repeating itself: maybe it missed ours.
+                    self._send(self._elem_pkt, self._conf_pkt)
+                    last_reply = now
+            elif kind == b"C" and self.secret is not None:
+                peer_info = _pake_open(self._theirs, b"C", body)
+                if peer_info is None:
+                    raise PakeMismatch()
+                if len(peer_info) < 2 or peer_info[0] != _PAKE_VERSION:
+                    raise PakeMismatch()
+                print()
+                return peer_info[1]
+        print()
+        return None
+
+    def exchange(self, kind: bytes, payload: bytes, timeout):
+        """Swap one encrypted message of `kind` with the peer (after handshake)."""
+        pkt   = _pake_seal(self._mine, kind, payload)
+        start = time.time()
+        last_send = 0.0
+        while time.time() - start < timeout:
+            now = time.time()
+            if now - last_send >= PAKE_RESEND:
+                # Re-send our confirmation too, in case the peer missed it.
+                self._send(self._conf_pkt, pkt)
+                last_send = now
+            got = self._recv(0.25)
+            if got is None or got[0] != kind:
+                continue
+            peer_payload = _pake_open(self._theirs, kind, got[1])
+            if peer_payload is not None:
+                return peer_payload
+        return None
+
+
+# ===============================================================================
 # Reliable Transfer  (selective-repeat ARQ over UDP)
 # ===============================================================================
 
@@ -2201,7 +2454,7 @@ def _resume_binary_search(sock, peer, cipher, partial_path, partial_chunks,
 BANNER = r"""
   +-----------------------------------------+
   |   p2p.py -- encrypted hole-punch xfer   |
-  |   no dependencies . no relay server     |
+  |   no dependencies . short PAKE codes    |
   +-----------------------------------------+
 """
 
@@ -2222,7 +2475,136 @@ def _relay_reachable():
         return False
 
 
-def cmd_send(filepath, connect_timeout=CONNECT_TIMEOUT):
+def _use_relay_mode():
+    """Switch to relay transport and its bigger chunk/window sizes."""
+    global USE_RELAY, CHUNK_SIZE, WINDOW_SIZE, ACK_TIMEOUT
+    USE_RELAY   = True
+    CHUNK_SIZE  = RELAY_CHUNK_SIZE
+    WINDOW_SIZE = RELAY_WINDOW_SIZE
+    ACK_TIMEOUT = RELAY_ACK_TIMEOUT
+
+
+def _bind_udp():
+    """Returns (sock, local_ip, local_port). Exits on failure."""
+    family    = socket.AF_INET6 if USE_IPV6 else socket.AF_INET
+    bind_host = "::" if USE_IPV6 else ""
+    try:
+        sock = socket.socket(family, socket.SOCK_DGRAM)
+        if USE_IPV6:
+            try:
+                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            except (AttributeError, OSError):
+                pass
+        sock.bind((bind_host, 0))
+    except OSError as e:
+        print(f"  Error: cannot create UDP socket: {e}")
+        sys.exit(1)
+    return sock, get_local_ip(), sock.getsockname()[1]   # index 1 = port for both AF families
+
+
+def _discover_endpoint(sock, local_ip, local_port):
+    """STUN (skipped in relay mode). Returns (pub_ip, pub_port)."""
+    if USE_RELAY:
+        _vprint("  Relay mode: skipping STUN and hole punching.")
+        pub = None
+    else:
+        _vprint("  Discovering public endpoint via STUN...")
+        pub = stun_discover(sock)
+    if pub:
+        pub_ip, pub_port = pub
+        try:
+            if USE_IPV6:
+                socket.inet_pton(socket.AF_INET6, pub_ip)
+            else:
+                socket.inet_aton(pub_ip)   # guard: only same-family addresses
+            _vprint(f"  Public : {_fmt_addr(pub_ip, pub_port)}")
+        except OSError:
+            pub_ip, pub_port = local_ip, local_port
+            _vprint("  STUN returned wrong-family address -- using local address.")
+    else:
+        pub_ip, pub_port = local_ip, local_port
+        if USE_RELAY:
+            pass   # addresses in the codes are unused in relay mode
+        elif USE_IPV6:
+            _vprint("  STUN failed -- using local IPv6 address (IPv6 has no NAT).")
+        else:
+            _vprint("  STUN failed -- using local address (LAN-only transfer).")
+    _vprint(f"  Local  : {_fmt_addr(local_ip, local_port)}")
+    if not USE_RELAY and _is_cgnat(pub_ip):
+        print(_CGNAT_WARNING.format(ip=pub_ip))
+    return pub_ip, pub_port
+
+
+def _pake_connect(code, is_sender, sock, local_ip, local_port, connect_timeout):
+    """
+    Short-code flow: meet the peer at the relay, run SPAKE2, agree on the
+    mode and (direct mode only) swap addresses. Returns
+    (secret, salt, peer_pub, peer_local); the peer addresses are None in
+    relay mode. Exits on failure.
+    """
+    nameplate, password = parse_pake_code(code)
+    my_flags = (_PAKE_F_RELAY if USE_RELAY else 0) | (_PAKE_F_IPV6 if USE_IPV6 else 0)
+    other = "receiver" if is_sender else "sender"
+    sess = PakeSession(nameplate, password, is_sender)
+    try:
+        status = "Waiting for the receiver to enter the code..." if is_sender else "Finding the sender..."
+        hint = None if is_sender else (
+            "\n  Taking a while. Check that the sender is still waiting and that the\n"
+            "  number at the start of the code is right.")
+        try:
+            peer_flags = sess.handshake(my_flags, connect_timeout, status, hint)
+        except PakeMismatch:
+            print("\n  Error: the codes didn't match.")
+            print("  Check the code for typos. Each code allows only one attempt, so the")
+            print("  sender has to run 'send' again for a new code.")
+            sock.close()
+            sys.exit(1)
+        if peer_flags is None:
+            print(f"  Timed out: the {other} never showed up.")
+            sock.close()
+            sys.exit(1)
+        print("  Code verified.")
+
+        if (my_flags | peer_flags) & _PAKE_F_RELAY:
+            if not USE_RELAY:
+                print(f"  The {other} asked for --relay, so the transfer goes through the relay.")
+            _use_relay_mode()
+            return sess.secret, _pake_salt(sess.secret), None, None
+
+        if bool(peer_flags & _PAKE_F_IPV6) != USE_IPV6:
+            print("  Error: address-family mismatch.")
+            print(f"  The {other} is using {'IPv6 (-6)' if peer_flags & _PAKE_F_IPV6 else 'IPv4'}."
+                  " Both sides must agree on -6 (or neither), or use --relay.")
+            sock.close()
+            sys.exit(1)
+
+        # STUN only now, with both sides present, so the NAT mapping is fresh
+        # when hole punching starts.
+        pub_ip, pub_port = _discover_endpoint(sock, local_ip, local_port)
+        mine = (_ip_pack(pub_ip) + struct.pack("!H", pub_port)
+                + _ip_pack(local_ip) + struct.pack("!H", local_port))
+        theirs = sess.exchange(b"A", mine, connect_timeout)
+        if theirs is None or len(theirs) != len(mine):
+            print(f"  Error: lost contact with the {other} while exchanging addresses.")
+            sock.close()
+            sys.exit(1)
+        peer_pub_ip, off = _ip_unpack(theirs, 0)
+        (peer_pub_port,) = struct.unpack("!H", theirs[off:off + 2])
+        peer_local_ip, off = _ip_unpack(theirs, off + 2)
+        (peer_local_port,) = struct.unpack("!H", theirs[off:off + 2])
+        _vprint(f"  Peer public : {_fmt_addr(peer_pub_ip, peer_pub_port)}")
+        _vprint(f"  Peer local  : {_fmt_addr(peer_local_ip, peer_local_port)}")
+        return (sess.secret, _pake_salt(sess.secret),
+                (peer_pub_ip, peer_pub_port), (peer_local_ip, peer_local_port))
+    except KeyboardInterrupt:
+        print("\n  Cancelled.")
+        sock.close()
+        sys.exit(0)
+    finally:
+        sess.close()
+
+
+def cmd_send(filepath, connect_timeout=CONNECT_TIMEOUT, long_code=False):
     # ---- Pre-flight checks --------------------------------------------------
     if not os.path.isfile(filepath):
         print(f"  Error: '{filepath}' not found or is not a file.")
@@ -2254,59 +2636,19 @@ def cmd_send(filepath, connect_timeout=CONNECT_TIMEOUT):
     filehash = sha.hexdigest()
 
     # ---- Bind UDP socket ----------------------------------------------------
-    family    = socket.AF_INET6 if USE_IPV6 else socket.AF_INET
-    bind_host = "::" if USE_IPV6 else ""
-    try:
-        sock = socket.socket(family, socket.SOCK_DGRAM)
-        if USE_IPV6:
-            try:
-                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
-            except (AttributeError, OSError):
-                pass
-        sock.bind((bind_host, 0))
-    except OSError as e:
-        print(f"  Error: cannot create UDP socket: {e}")
-        sys.exit(1)
+    sock, local_ip, local_port = _bind_udp()
 
-    local_port = sock.getsockname()[1]   # index 1 = port for both AF families
-    local_ip   = get_local_ip()
-
-    # ---- STUN ---------------------------------------------------------------
-    if USE_RELAY:
-        _vprint("  Relay mode: skipping STUN and hole punching.")
-        pub = None
-    else:
-        _vprint("  Discovering public endpoint via STUN...")
-        pub = stun_discover(sock)
-    if pub:
-        pub_ip, pub_port = pub
-        try:
-            if USE_IPV6:
-                socket.inet_pton(socket.AF_INET6, pub_ip)
-            else:
-                socket.inet_aton(pub_ip)   # guard: only same-family addresses
-            _vprint(f"  Public : {_fmt_addr(pub_ip, pub_port)}")
-        except OSError:
-            pub_ip, pub_port = local_ip, local_port
-            _vprint("  STUN returned wrong-family address -- using local address.")
-    else:
-        pub_ip, pub_port = local_ip, local_port
+    if long_code:
+        pub_ip, pub_port = _discover_endpoint(sock, local_ip, local_port)
+        secret = secrets.token_bytes(16)
         if USE_RELAY:
-            pass   # addresses in the codes are unused in relay mode
-        elif USE_IPV6:
-            _vprint("  STUN failed -- using local IPv6 address (IPv6 has no NAT).")
+            salt = _relay_salt(secret)
+            code = encode_relay_code(secret)
         else:
-            _vprint("  STUN failed -- using local address (LAN-only transfer).")
-    _vprint(f"  Local  : {_fmt_addr(local_ip, local_port)}")
-    if not USE_RELAY and _is_cgnat(pub_ip):
-        print(_CGNAT_WARNING.format(ip=pub_ip))
-    secret = secrets.token_bytes(16)
-    if USE_RELAY:
-        salt = _relay_salt(secret)
-        code = encode_relay_code(secret)
+            salt = secrets.token_bytes(16)
+            code = encode_sender_code(secret, salt, pub_ip, pub_port, local_ip, local_port)
     else:
-        salt = secrets.token_bytes(16)
-        code = encode_sender_code(secret, salt, pub_ip, pub_port, local_ip, local_port)
+        code = make_pake_code()
 
     print()
     print("  +==========================================================+")
@@ -2316,7 +2658,14 @@ def cmd_send(filepath, connect_timeout=CONNECT_TIMEOUT):
     print(f"  {code}")
     print()
 
-    if USE_RELAY:
+    if not long_code:
+        # Short code: the receiver types it in and both sides meet at the
+        # relay; there is nothing to paste back.
+        secret, salt, peer_pub, peer_local = _pake_connect(
+            code, True, sock, local_ip, local_port, connect_timeout)
+        if not USE_RELAY:
+            (peer_pub_ip, peer_pub_port), (peer_local_ip, peer_local_port) = peer_pub, peer_local
+    elif USE_RELAY:
         # Relay mode: there is no receiver code. We are already holding the
         # secret, so go straight to the relay and wait for the receiver there.
         print("  Relay mode: nothing to paste back. The receiver needs only the code above.")
@@ -2340,7 +2689,7 @@ def cmd_send(filepath, connect_timeout=CONNECT_TIMEOUT):
         if len(_rwords) != _expected_rwords:
             print("  Error: invalid receiver code.")
             if not USE_IPV6 and len(_rwords) == 42:
-                print("  The receiver is using IPv6 (-6). Re-run: python p2p.py send <file> -6")
+                print("  The receiver is using IPv6 (-6). Re-run: python p2p.py send <file> -6 --long-code")
             elif USE_IPV6 and len(_rwords) == 23:
                 print("  The receiver is using IPv4. Both sides must agree on -6 (or neither).")
             else:
@@ -2368,7 +2717,7 @@ def cmd_send(filepath, connect_timeout=CONNECT_TIMEOUT):
     relay_sock = None
     if USE_RELAY:
         # Relay mode: no hole punching at all -- both sides meet at the relay.
-        print("  Relay mode: connecting through the relay (receiver must also use --relay).")
+        print("  Relay mode: connecting through the relay" + (" (receiver must also use --relay)." if long_code else "."))
         token = _relay_session_token(secret)
         relay_sock = RelaySocket(RELAY_HOST, token, send_dir="s2r", recv_dir="r2s")
         try:
@@ -2450,52 +2799,7 @@ def cmd_recv(connect_timeout=CONNECT_TIMEOUT, max_size=MAX_FILE_SIZE, resume_pat
     save_dir = "."
 
     # ---- Bind ---------------------------------------------------------------
-    family    = socket.AF_INET6 if USE_IPV6 else socket.AF_INET
-    bind_host = "::" if USE_IPV6 else ""
-    try:
-        sock = socket.socket(family, socket.SOCK_DGRAM)
-        if USE_IPV6:
-            try:
-                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
-            except (AttributeError, OSError):
-                pass
-        sock.bind((bind_host, 0))
-    except OSError as e:
-        print(f"  Error: cannot create UDP socket: {e}")
-        sys.exit(1)
-
-    local_port = sock.getsockname()[1]   # index 1 = port for both AF families
-    local_ip   = get_local_ip()
-
-    # ---- STUN ---------------------------------------------------------------
-    if USE_RELAY:
-        _vprint("  Relay mode: skipping STUN and hole punching.")
-        pub = None
-    else:
-        _vprint("  Discovering public endpoint via STUN...")
-        pub = stun_discover(sock)
-    if pub:
-        pub_ip, pub_port = pub
-        try:
-            if USE_IPV6:
-                socket.inet_pton(socket.AF_INET6, pub_ip)
-            else:
-                socket.inet_aton(pub_ip)   # guard: only same-family addresses
-            _vprint(f"  Public : {_fmt_addr(pub_ip, pub_port)}")
-        except OSError:
-            pub_ip, pub_port = local_ip, local_port
-            _vprint("  STUN returned wrong-family address -- using local address.")
-    else:
-        pub_ip, pub_port = local_ip, local_port
-        if USE_RELAY:
-            pass   # addresses in the codes are unused in relay mode
-        elif USE_IPV6:
-            _vprint("  STUN failed -- using local IPv6 address (IPv6 has no NAT).")
-        else:
-            _vprint("  STUN failed -- using local address (LAN-only transfer).")
-    _vprint(f"  Local  : {_fmt_addr(local_ip, local_port)}")
-    if not USE_RELAY and _is_cgnat(pub_ip):
-        print(_CGNAT_WARNING.format(ip=pub_ip))
+    sock, local_ip, local_port = _bind_udp()
 
     # ---- Get sender code ----------------------------------------------------
     print()
@@ -2511,8 +2815,31 @@ def cmd_recv(connect_timeout=CONNECT_TIMEOUT, max_size=MAX_FILE_SIZE, resume_pat
         sock.close()
         sys.exit(1)
 
+    try:
+        long_code = parse_pake_code(scode) is None
+    except ValueError as e:
+        print("  Error: invalid sender code.")
+        print(f"  {e}" + (" (check the spelling)" if str(e).startswith("Unknown word") else ""))
+        sock.close()
+        sys.exit(1)
+
+    if not long_code:
+        if not USE_RELAY and not _relay_reachable():   # main() already checked with --relay
+            print(f"  Error: cannot reach the relay at {RELAY_HOST} to look up the code.")
+            print("  Check your internet connection, or point at another relay with --relay-host.")
+            sock.close()
+            sys.exit(1)
+        secret, salt, peer_pub, peer_local = _pake_connect(
+            scode, False, sock, local_ip, local_port, connect_timeout)
+        if not USE_RELAY:
+            (peer_pub_ip, peer_pub_port), (peer_local_ip, peer_local_port) = peer_pub, peer_local
+    else:
+        pub_ip, pub_port = _discover_endpoint(sock, local_ip, local_port)
+
     _nwords = len(scode.split())
-    if USE_RELAY:
+    if not long_code:
+        pass   # handled above
+    elif USE_RELAY:
         if _nwords in (36, 55):
             print("  Error: this is a direct-mode code (the sender did not use --relay).")
             print("  Both sides must use --relay, or neither.")
@@ -2578,7 +2905,7 @@ def cmd_recv(connect_timeout=CONNECT_TIMEOUT, max_size=MAX_FILE_SIZE, resume_pat
     relay_sock = None
     if USE_RELAY:
         # Relay mode: no hole punching at all -- both sides meet at the relay.
-        print("  Relay mode: connecting through the relay (sender must also use --relay).")
+        print("  Relay mode: connecting through the relay" + (" (sender must also use --relay)." if long_code else "."))
         token = _relay_session_token(secret)
         relay_sock = RelaySocket(RELAY_HOST, token, send_dir="r2s", recv_dir="s2r")
         try:
@@ -2697,8 +3024,12 @@ def main():
 
     if len(sys.argv) < 2 or "-h" in sys.argv[1:] or "--help" in sys.argv[1:]:
         print("  Usage:")
-        print("    python p2p.py send <file> [-6] [--relay] [--connect-timeout SECONDS] [--verbose]")
+        print("    python p2p.py send <file> [-6] [--relay] [--long-code] [--connect-timeout SECONDS] [--verbose]")
         print("    python p2p.py recv        [-6] [--relay] [--connect-timeout SECONDS] [--resume PARTIAL_FILE] [--verbose]")
+        print()
+        print("  The sender gets a short code like 4821-apple-river-ocean; the receiver")
+        print("  types it in. Both sides meet briefly at the relay to verify the code")
+        print("  (SPAKE2) and swap addresses, then the file goes directly peer-to-peer.")
         print()
         print("  -6                 Use IPv6 (both sides must agree). Bypasses NAT")
         print("                     entirely -- works wherever IPv6 is available.")
@@ -2709,10 +3040,13 @@ def main():
         print("                     how much was received correctly and resume from there.")
         print("  --verbose          Show technical connection details such as IP")
         print("                     addresses, STUN status, and handshake status.")
-        print("  --relay            Connect through the HTTPS relay instead of direct")
-        print("                     hole punching. BOTH sides must use it. Uses one")
-        print("                     short code (13 words) from the sender only.")
-        print("                     Without this flag the relay is never contacted.")
+        print("  --relay            Send the file itself through the HTTPS relay instead")
+        print("                     of direct hole punching. With short codes, one side")
+        print("                     using it is enough.")
+        print("  --long-code        (send) Use the old long word codes instead: no relay")
+        print("                     at all in direct mode, but the receiver has to send")
+        print("                     a code back. With --relay: one 13-word code, and")
+        print("                     both sides must use --relay.")
         print(f"  --relay-host HOST  Override the relay server (default: {RELAY_HOST}).")
         sys.exit(0)
 
@@ -2723,6 +3057,7 @@ def main():
     verbose         = False
     use_ipv6        = False
     use_relay       = False
+    long_code       = False
     old_no_relay    = False
     filtered        = []
     i = 0
@@ -2748,6 +3083,9 @@ def main():
         elif args[i] == "--relay":
             use_relay = True
             i += 1
+        elif args[i] == "--long-code":
+            long_code = True
+            i += 1
         elif args[i] == "--no-relay":   # old flag: direct-only is now the default
             old_no_relay = True
             i += 1
@@ -2758,14 +3096,11 @@ def main():
             filtered.append(args[i])
             i += 1
     args = filtered
-    global VERBOSE, USE_IPV6, USE_RELAY, CHUNK_SIZE, WINDOW_SIZE, ACK_TIMEOUT
+    global VERBOSE, USE_IPV6
     VERBOSE        = verbose
     USE_IPV6       = use_ipv6
-    USE_RELAY      = use_relay
-    if USE_RELAY:
-        CHUNK_SIZE  = RELAY_CHUNK_SIZE
-        WINDOW_SIZE = RELAY_WINDOW_SIZE
-        ACK_TIMEOUT = RELAY_ACK_TIMEOUT
+    if use_relay:
+        _use_relay_mode()
     if old_no_relay:
         print("  Note: --no-relay is no longer needed; the relay is only used with --relay.")
     if use_relay and old_no_relay:
@@ -2778,10 +3113,14 @@ def main():
 
     cmd = args[0].lower()
 
-    if USE_RELAY and cmd in ("send", "recv", "receive"):
+    # Short codes always meet at the relay; a receiver only knows which kind
+    # of code it has once it is pasted, so cmd_recv checks that case itself.
+    if (USE_RELAY and cmd in ("send", "recv", "receive")) or (cmd == "send" and not long_code):
         if not _relay_reachable():
             print(f"  Error: cannot reach the relay at {RELAY_HOST}.")
             print("  Check your internet connection, or point at another relay with --relay-host.")
+            if not USE_RELAY:
+                print("  Or use --long-code for a direct transfer that never contacts the relay.")
             sys.exit(1)
 
     try:
@@ -2789,7 +3128,7 @@ def main():
             if len(args) < 2:
                 print("  Usage: python p2p.py send <file> [-6]")
                 sys.exit(1)
-            cmd_send(args[1], connect_timeout=connect_timeout)
+            cmd_send(args[1], connect_timeout=connect_timeout, long_code=long_code)
 
         elif cmd in ("recv", "receive"):
             cmd_recv(connect_timeout=connect_timeout, resume_path=resume_path)

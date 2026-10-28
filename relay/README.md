@@ -1,8 +1,12 @@
 # p2p relay
 
-HTTPS relay for `p2p.py`, used only when **both** sides run with `--relay`.
-Without that flag the client never contacts it. It is a dumb in-memory pipe;
-packets are already encrypted by the client.
+HTTPS relay for `p2p.py`. With the default short codes (`4821-apple-river-ocean`)
+it is the meeting point: both sides find each other in a mailbox picked by the
+number, run SPAKE2 and swap their addresses there, then (in direct mode) leave.
+With `--relay` on either side the whole transfer goes through it. With
+`send --long-code` and no `--relay` the client never contacts it. It is a dumb
+in-memory pipe; everything is already encrypted by the client, and the relay
+never sees anything derived from the code's words.
 
 ## Build and run
 

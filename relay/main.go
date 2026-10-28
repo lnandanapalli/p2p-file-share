@@ -1,4 +1,5 @@
-// p2p.py relay server (opt-in: only used when both peers run with --relay).
+// p2p.py relay server: the meeting point for short-code (SPAKE2) handshakes,
+// and the transport for transfers run with --relay.
 //
 // Purpose: for networks where UDP hole punching cannot work (both peers
 // behind virtualized/nested NAT, CG-NAT, strict firewalls), both peers

@@ -6,7 +6,7 @@ Send a file from one browser to another with a short code, nothing to install. T
 2. The receiver opens the page, enters the code (or opens the link), and accepts the file.
 3. The file goes **directly between the two browsers** (WebRTC) when possible, otherwise **through the relay**. Either way it is end-to-end encrypted.
 
-Plain HTML and JavaScript: no build step, no frameworks, no third-party code.
+Plain HTML and JavaScript: no frameworks, no npm, no third-party code. The container is a small Go server with no dependencies either.
 
 ## How it works
 
@@ -23,25 +23,33 @@ There is no TURN server: when two networks can't connect directly, the relay pla
 
 ## Deploying
 
+Runs as a container on the same App Service plan as the relay (one Linux plan can host any number of apps).
+
 ### 1. Relay
 
-The relay must allow this site's origin. It reads `RELAY_ALLOWED_ORIGINS` (comma-separated), which defaults to `https://share.nlpdf.site`. If that's your domain, just redeploy the relay; otherwise set the variable in the App Service's **Environment variables** (App settings), e.g.:
+The relay must allow this site's origin. It reads `RELAY_ALLOWED_ORIGINS` (comma-separated), which defaults to `https://share.nlpdf.site`. If that's your domain, nothing to set; otherwise add it as an App Service app setting on the relay, e.g. `RELAY_ALLOWED_ORIGINS=https://share.nlpdf.site`.
 
-```
-RELAY_ALLOWED_ORIGINS=https://share.nlpdf.site
-```
+### 2. This site
 
-### 2. The site
+`Dockerfile` builds a tiny image (a static Go binary on `scratch`, like the relay). The binary contains the files in `site/` and serves them with security headers, including a Content-Security-Policy that only lets the page talk to itself and the relay.
 
-Serve the files in this folder as static files over **HTTPS** (browsers only allow the crypto it uses on secure pages). Any static host works. With **Azure Static Web Apps** (free tier, custom domain + certificate included):
+    docker build --platform linux/amd64 -t p2pweb .
+    docker run -p 8080:8080 p2pweb
 
-- App location: `web`, no build step (no API, no output location).
-- `staticwebapp.config.json` adds security headers, including a Content-Security-Policy that only lets the page talk to itself and the relay.
-- Add `share.nlpdf.site` as a custom domain.
+On App Service: create a second Web App (container, Linux) on the existing plan from this image, then
 
-### 3. Settings
+- set `WEBSITES_PORT=8080`,
+- add `share.nlpdf.site` as a custom domain with a managed certificate (the page must be served over HTTPS),
+- optionally set the health check path to `/healthz`.
 
-`config.js` holds the relay URL and STUN servers. If you change the relay URL, also change it in the `connect-src` part of `staticwebapp.config.json` (or the page can't reach it).
+Settings (App Service app settings / environment variables):
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `RELAY_URL` | `https://relay.nlpdf.site` | The relay. Written into `config.js` and the page's Content-Security-Policy, so changing it needs no rebuild. |
+| `WEB_ADDR` | `:8080` | Listen address |
+
+Files are revalidated on every load (cheap `304`s), so a new deployment takes effect immediately.
 
 ## Browser support
 
@@ -55,12 +63,12 @@ Written for current Chrome, Edge, Firefox and Safari (it uses only standard WebC
 
 | File | Purpose |
 |---|---|
-| `index.html` | The page and its styles |
-| `app.js` | Page logic |
-| `session.js` | One send/receive: rendezvous, SPAKE2, WebRTC or relay, file protocol |
-| `transport.js` | Relay mailbox pipe, WebRTC pipe, and the encrypted acknowledged stream |
-| `crypto.js` | Codes, SPAKE2, AES-GCM (WebCrypto + BigInt) |
-| `timers.js` | Worker-based timers, so background tabs aren't slowed down |
-| `words.js` | The 1024-word code list |
-| `config.js` | Relay URL and STUN servers |
-| `staticwebapp.config.json` | Security headers for Azure Static Web Apps |
+| `site/index.html` | The page and its styles |
+| `site/app.js` | Page logic |
+| `site/session.js` | One send/receive: rendezvous, SPAKE2, WebRTC or relay, file protocol |
+| `site/transport.js` | Relay mailbox pipe, WebRTC pipe, and the encrypted acknowledged stream |
+| `site/crypto.js` | Codes, SPAKE2, AES-GCM (WebCrypto + BigInt) |
+| `site/timers.js` | Worker-based timers, so background tabs aren't slowed down |
+| `site/words.js` | The 1024-word code list |
+| `site/config.js` | Relay URL (replaced from `RELAY_URL` by the server) and STUN servers |
+| `main.go`, `go.mod`, `Dockerfile` | The container: a small static file server with security headers |

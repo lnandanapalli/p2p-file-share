@@ -2,6 +2,7 @@
 
 // The relay (relay/ in this repo). It must list this site's origin in its
 // RELAY_ALLOWED_ORIGINS setting, e.g. https://share.nlpdf.site.
+// The web container replaces this line with its RELAY_URL setting.
 export const RELAY_URL = "https://relay.nlpdf.site";
 
 // STUN servers WebRTC uses to find each browser's public address. There is

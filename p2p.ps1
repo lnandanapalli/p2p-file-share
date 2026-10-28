@@ -98,6 +98,7 @@ namespace P2PShellV2
                           T_DONEACK = 6, T_ABORT = 7, T_HASHQ = 8, T_HASHR = 9;
 
         public static bool Verbose, UseIPv6, UseRelay;
+        public static bool UseAes;     // set when both sides can do AES-256 (short codes only)
 
         public const string DirectHint =
             "\n  Taking a while. If this keeps failing (strict NAT, CG-NAT, VM networking),\n" +
@@ -111,7 +112,7 @@ namespace P2PShellV2
         public static void Reset()
         {
             ChunkSize = DirectChunkSize; WindowSize = DirectWindowSize; AckTimeout = DirectAckTimeout;
-            RelayHost = DefaultRelayHost; Verbose = false; UseIPv6 = false; UseRelay = false;
+            RelayHost = DefaultRelayHost; Verbose = false; UseIPv6 = false; UseRelay = false; UseAes = false;
         }
     }
 
@@ -355,11 +356,78 @@ namespace P2PShellV2
     }
 
     // ========================================================================
+    // AES-256-CTR from .NET's built-in AES (ECB over counter blocks). Counter
+    // block = 8-byte packet nonce || 8-byte big-endian block index, the same
+    // layout p2p.py gets from OpenSSL. Used only when both sides can.
+    // ========================================================================
+    internal static class AesCtr
+    {
+        static int available = -1;
+
+        public static ICryptoTransform Create(byte[] key)
+        {
+            Aes a = Aes.Create();
+            a.Mode = CipherMode.ECB;
+            a.Padding = PaddingMode.None;
+            a.Key = key;
+            return a.CreateEncryptor();
+        }
+
+        // XOR data[offset..offset+len) in place with the keystream.
+        public static void Xor(ICryptoTransform ecb, byte[] nonce, byte[] data, int offset, int len)
+        {
+            if (len <= 0) return;
+            int nb = (len + 15) / 16;
+            byte[] ctr = new byte[nb * 16];
+            for (int b = 0; b < nb; b++)
+            {
+                Buffer.BlockCopy(nonce, 0, ctr, b * 16, 8);
+                Buffer.BlockCopy(U.BE64((ulong)b), 0, ctr, b * 16 + 8, 8);
+            }
+            byte[] ks = new byte[ctr.Length];
+            ecb.TransformBlock(ctr, 0, ctr.Length, ks, 0);
+            for (int i = 0; i < len; i++) data[offset + i] ^= ks[i];
+        }
+
+        // NIST SP 800-38A F.5.5 (CTR-AES256) known-answer test before trusting it.
+        public static bool Available
+        {
+            get
+            {
+                if (available < 0)
+                {
+                    try
+                    {
+                        byte[] key = FromHex("603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4");
+                        byte[] ctr = FromHex("f0f1f2f3f4f5f6f7f8f9fafbfcfdfefff0f1f2f3f4f5f6f7f8f9fafbfcfdff00");
+                        byte[] pt = FromHex("6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e51");
+                        byte[] ct = FromHex("601ec313775789a5b7a7f504bbf3d228f443e3ca4d62b59aca84e990cacaf5c5");
+                        byte[] ks = new byte[32];
+                        Create(key).TransformBlock(ctr, 0, 32, ks, 0);
+                        for (int i = 0; i < 32; i++) ks[i] ^= pt[i];
+                        available = U.ConstEq(ks, ct) ? 1 : 0;
+                    }
+                    catch { available = 0; }
+                }
+                return available == 1;
+            }
+        }
+
+        static byte[] FromHex(string h)
+        {
+            byte[] r = new byte[h.Length / 2];
+            for (int i = 0; i < r.Length; i++) r[i] = Convert.ToByte(h.Substring(2 * i, 2), 16);
+            return r;
+        }
+    }
+
+    // ========================================================================
     // Cipher -- identical construction to p2p.py's Cipher
     // ========================================================================
     internal class Cipher
     {
         readonly byte[] ek, mk, dk, dmk;
+        readonly ICryptoTransform encAes, decAes;   // null unless both sides do AES
         readonly HMACSHA256 encMac, decMac;
         readonly SHA256 sha = U.NewSha();
         readonly byte[] ksIn = new byte[48];     // key(32) + nonce(8) + blk(8)
@@ -368,7 +436,7 @@ namespace P2PShellV2
         HashSet<ulong> window = new HashSet<ulong>();
         const int NonceWindow = 65536;
 
-        public Cipher(byte[] secret, byte[] salt, bool isSender)
+        public Cipher(byte[] secret, byte[] salt, bool isSender, bool aes)
         {
             byte[] km = Pbkdf2Sha256(secret, salt, 100000, 128);
             byte[] s2rEnc = U.Slice(km, 0, 32), s2rMac = U.Slice(km, 32, 32);
@@ -377,6 +445,7 @@ namespace P2PShellV2
             else          { ek = r2sEnc; mk = r2sMac; dk = s2rEnc; dmk = s2rMac; }
             encMac = new HMACSHA256(mk);
             decMac = new HMACSHA256(dmk);
+            if (aes) { encAes = AesCtr.Create(ek); decAes = AesCtr.Create(dk); }
         }
 
         // RFC 8018 PBKDF2 with HMAC-SHA256 (Rfc2898DeriveBytes only supports
@@ -427,7 +496,8 @@ namespace P2PShellV2
             pkt[0] = ptype;
             Buffer.BlockCopy(nonce, 0, pkt, 1, 8);
             Buffer.BlockCopy(plaintext, 0, pkt, 9, plaintext.Length);
-            XorKeystream(ek, nonce, pkt, 9, plaintext.Length);
+            if (encAes != null) AesCtr.Xor(encAes, nonce, pkt, 9, plaintext.Length);
+            else XorKeystream(ek, nonce, pkt, 9, plaintext.Length);
             byte[] mac = encMac.ComputeHash(pkt, 0, 9 + plaintext.Length);
             Buffer.BlockCopy(mac, 0, pkt, 9 + plaintext.Length, 16);
             return pkt;
@@ -463,7 +533,8 @@ namespace P2PShellV2
             }
             ptype = raw[0];
             payload = U.Slice(raw, 9, ctLen);
-            XorKeystream(dk, U.Slice(raw, 1, 8), payload, 0, ctLen);
+            if (decAes != null) AesCtr.Xor(decAes, U.Slice(raw, 1, 8), payload, 0, ctLen);
+            else XorKeystream(dk, U.Slice(raw, 1, 8), payload, 0, ctLen);
             return true;
         }
     }
@@ -977,7 +1048,7 @@ namespace P2PShellV2
         public const int Words = 3;
         public const double Resend = 5.0;      // seconds between rendezvous resends
         public const double ReplyGap = 1.0;    // min gap between replies to a peer's repeats
-        public const byte Version = 1, FRelay = 1, FIPv6 = 2;
+        public const byte Version = 1, FRelay = 1, FIPv6 = 2, FAes = 4;
         public static readonly byte[] Magic = Encoding.ASCII.GetBytes("SPK1");
         public static readonly BigInteger Q = (DH.P - 1) / 2;
         public static readonly BigInteger M = HashToGroup("p2p-spake2-M-v1");
@@ -2309,7 +2380,8 @@ namespace P2PShellV2
             secret = null; salt = null; peerPub = null; peerLocal = null;
             string nameplate; byte[] password;
             Pake.ParseCode(code, out nameplate, out password);
-            byte myFlags = (byte)((Cfg.UseRelay ? Pake.FRelay : 0) | (Cfg.UseIPv6 ? Pake.FIPv6 : 0));
+            byte myFlags = (byte)((Cfg.UseRelay ? Pake.FRelay : 0) | (Cfg.UseIPv6 ? Pake.FIPv6 : 0) |
+                                  (AesCtr.Available ? Pake.FAes : 0));
             string other = isSender ? "receiver" : "sender";
             PakeSession sess = new PakeSession(nameplate, password, isSender);
             try
@@ -2329,6 +2401,10 @@ namespace P2PShellV2
                 }
                 if (peerFlags < 0) { U.Line("  Timed out: the " + other + " never showed up."); throw new ExitException(1); }
                 U.Line("  Code verified.");
+                Cfg.UseAes = (myFlags & peerFlags & Pake.FAes) != 0;
+                if (Cfg.UseAes) U.Line("  Encryption: AES-256-CTR + HMAC-SHA256.");
+                else U.Line("  Encryption: SHA-256-CTR + HMAC-SHA256 (AES isn't available on " +
+                            ((myFlags & Pake.FAes) == 0 ? "this machine" : "the " + other + "'s machine") + ").");
 
                 if (((myFlags | peerFlags) & Pake.FRelay) != 0)
                 {
@@ -2450,7 +2526,7 @@ namespace P2PShellV2
                 }
 
                 U.V("  Deriving handshake keys (PBKDF2, 100k rounds)...");
-                Cipher hs = new Cipher(secret, salt, true);
+                Cipher hs = new Cipher(secret, salt, true, Cfg.UseAes);
                 BigInteger dhPriv; byte[] dhPub;
                 DH.Keypair(out dhPriv, out dhPub);
 
@@ -2494,7 +2570,7 @@ namespace P2PShellV2
                 try { dhShared = DH.Shared(dhPriv, peerDh); }
                 catch (ArgumentException e) { U.Line("  Handshake error: " + e.Message); return 1; }
                 U.V("  Forward-secret session keys established (DH + PBKDF2).");
-                Cipher session = new Cipher(U.Cat(secret, dhShared), salt, true);
+                Cipher session = new Cipher(U.Cat(secret, dhShared), salt, true, Cfg.UseAes);
 
                 bool sent = Proto.SendFile(xfer, peer, session, filepath, filesize, filehash, connectTimeout);
                 if (!sent) return 1;
@@ -2607,7 +2683,7 @@ namespace P2PShellV2
                 }
 
                 U.V("  Deriving handshake keys (PBKDF2, 100k rounds)...");
-                Cipher hs = new Cipher(secret, salt, false);
+                Cipher hs = new Cipher(secret, salt, false, Cfg.UseAes);
                 BigInteger dhPriv; byte[] dhPub;
                 DH.Keypair(out dhPriv, out dhPub);
 
@@ -2651,7 +2727,7 @@ namespace P2PShellV2
                 try { dhShared = DH.Shared(dhPriv, peerDh); }
                 catch (ArgumentException e) { U.Line("  Handshake error: " + e.Message); return 1; }
                 U.V("  Forward-secret session keys established (DH + PBKDF2).");
-                Cipher session = new Cipher(U.Cat(secret, dhShared), salt, false);
+                Cipher session = new Cipher(U.Cat(secret, dhShared), salt, false, Cfg.UseAes);
 
                 Proto.RecvResult res = Proto.RecvFile(xfer, peer, session, connectTimeout, Cfg.MaxFileSize, resumePath);
                 if (res == null) return 1;

@@ -151,14 +151,14 @@ If both peers are on the same LAN, it will connect via local addresses regardles
 
 ## Crypto
 
-> **Warning:** The encryption uses a non-standard construction built from `hashlib` and `hmac` for zero-dependency portability. It has not been independently audited. Do not use this for high-stakes or life-safety transfers. For those, use other tools of your choice. This only helps when you have a low-stakes scenario but cannot install anything on the machine. You should also have Python on the machine. You could also manually encrypt using some other tool before sending which adds an additional layer of security.
+> **Warning:** When AES isn't available on both sides (and always with `--long-code`), the encryption uses a non-standard construction built from `hashlib` and `hmac` for zero-dependency portability. It has not been independently audited. Do not use this for high-stakes or life-safety transfers. For those, use other tools of your choice. This only helps when you have a low-stakes scenario but cannot install anything on the machine. You should also have Python on the machine. You could also manually encrypt using some other tool before sending which adds an additional layer of security.
 
 What it does:
 
 - **Short codes:** SPAKE2 ([RFC 9382](https://www.rfc-editor.org/rfc/rfc9382)) in the RFC 3526 Group 14 prime-order subgroup, with explicit key confirmation. M and N are hashed into the group, so nobody knows their discrete logs. The relay mailbox ID is derived from the number only, never from the words.
 - **Key derivation:** PBKDF2-HMAC-SHA256, 100k rounds, salt derived from the SPAKE2 key (random with `--long-code`)
 - **Key exchange:** Ephemeral Diffie-Hellman (RFC 3526 Group 14, 2048-bit MODP) for forward secrecy
-- **Encryption:** SHA-256 in counter mode as a stream cipher (generates keystream blocks via `SHA-256(key || nonce || counter)`, XORed with plaintext)
+- **Encryption:** AES-256 in counter mode when both sides can do it, otherwise SHA-256 in counter mode as a stream cipher (keystream blocks via `SHA-256(key || nonce || counter)`, XORed with plaintext). Python has no AES in its standard library, so `p2p.py` borrows it from the OpenSSL library that Python's own `ssl` module ships with (via `ctypes`, still nothing to install) and checks it against a NIST test vector first; `p2p.ps1` uses .NET's built-in AES. The two sides agree on the cipher while verifying the short code, and each prints which one is in use. `--long-code` transfers always use the SHA-256 cipher, so they stay compatible with older versions.
 - **Authentication:** HMAC-SHA256 truncated to 128 bits, per packet
 - **Integrity:** SHA-256 hash of the entire file, verified on receive
 - **Replay protection:** Sliding-window nonce tracking
@@ -202,7 +202,7 @@ No `pip install`. No virtualenv. Just the one file.
 - **Short codes need the relay as a meeting point.** If it is down, use `send --long-code`.
 - **Single file only.** To send a directory, tar/zip it first.
 - **Manual resume only.** If the transfer drops, restart `recv` with the `--resume` command printed by the previous attempt. Resume depends on keeping the preserved partial/temp file.
-- **Non-standard crypto.** The stream cipher is homebrew. It's built from solid primitives (SHA-256, HMAC, PBKDF2, DH) but the composition hasn't been formally analyzed. See the warning above.
+- **Non-standard crypto (fallback).** Without AES on both sides, the stream cipher is homebrew. It's built from solid primitives (SHA-256, HMAC, PBKDF2, DH) but the composition hasn't been formally analyzed. See the warning above.
 
 ## License
 

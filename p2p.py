@@ -41,7 +41,8 @@ Crypto:
     - Long codes: 128-bit random secret (embedded in the send code)
     - PBKDF2-HMAC-SHA256 key derivation (random salt) -> separate keys per direction
     - Ephemeral Diffie-Hellman (RFC 3526 Group 14) for forward secrecy
-    - SHA-256 in CTR mode as a stream cipher (XOR keystream)
+    - AES-256-CTR (OpenSSL via ctypes) when both sides can, else
+      SHA-256 in CTR mode as a stream cipher (XOR keystream)
     - HMAC-SHA256 truncated to 128 bits for per-packet authentication
     - SHA-256 file hash for end-to-end integrity verification
 
@@ -156,6 +157,7 @@ RECV_BUF = 65536
 VERBOSE  = False
 USE_IPV6 = False
 USE_RELAY      = False   # --relay: skip hole punching, use the HTTPS relay only
+USE_AES        = False   # set when both sides can do AES-256 (short codes only)
 
 
 def _vprint(*args, **kwargs):
@@ -480,20 +482,169 @@ def _fmt_addr(ip: str, port: int) -> str:
 # ===============================================================================
 
 
+# ---- AES-256-CTR via the OpenSSL library Python itself already uses -----------
+#
+# The standard library has no AES, but every normal Python build ships
+# OpenSSL for its ssl module, and ctypes (also stdlib) can call it. Used only
+# when BOTH sides can (agreed during the short-code handshake); otherwise the
+# SHA-256 keystream below is used. Nothing is installed either way.
+#
+# Where OpenSSL is found:
+#   - Windows: libcrypto-*.dll next to _ssl.pyd (python.org / Store builds).
+#   - Elsewhere: _ssl's own shared object first; dlsym on it also searches
+#     the libcrypto it links against. Then the libcrypto already mapped into
+#     this process (Linux), Homebrew's OpenSSL (macOS), or the system one
+#     (Linux/BSD). macOS's /usr/lib/libcrypto.dylib is never touched: loading
+#     it unversioned aborts the whole process.
+# Whatever is found must pass a NIST known-answer test before it is trusted.
+
+_AES_LIB = None        # loaded lazily by _aes_available()
+_AES_CHECKED = False
+
+# NIST SP 800-38A, F.5.5 (CTR-AES256.Encrypt), first two blocks.
+_AES_KAT_KEY = bytes.fromhex("603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4")
+_AES_KAT_IV  = bytes.fromhex("f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff")
+_AES_KAT_PT  = bytes.fromhex("6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e51")
+_AES_KAT_CT  = bytes.fromhex("601ec313775789a5b7a7f504bbf3d228f443e3ca4d62b59aca84e990cacaf5c5")
+
+
+def _libcrypto_candidates():
+    try:
+        import _ssl
+        ssl_file = getattr(_ssl, "__file__", None)
+    except ImportError:
+        return []
+    cands = []
+    if sys.platform == "win32":
+        if ssl_file:
+            d = os.path.dirname(ssl_file)
+            try:
+                names = sorted((n for n in os.listdir(d)
+                                if n.lower().startswith("libcrypto") and n.lower().endswith(".dll")),
+                               reverse=True)
+            except OSError:
+                names = []
+            cands += [os.path.join(d, n) for n in names]
+        return cands
+    if ssl_file:
+        cands.append(ssl_file)
+    if sys.platform.startswith("linux"):
+        try:
+            with open("/proc/self/maps") as f:
+                for line in f:
+                    path = line.split()[-1] if line.strip() else ""
+                    if "libcrypto" in os.path.basename(path) and path not in cands:
+                        cands.append(path)
+        except OSError:
+            pass
+    if sys.platform == "darwin":
+        cands += ["/opt/homebrew/opt/openssl@3/lib/libcrypto.3.dylib",
+                  "/usr/local/opt/openssl@3/lib/libcrypto.3.dylib"]
+    else:
+        try:
+            import ctypes.util
+            name = ctypes.util.find_library("crypto")
+            if name:
+                cands.append(name)
+        except Exception:
+            pass
+    return cands
+
+
+def _aes_available() -> bool:
+    """True if AES-256-CTR from OpenSSL is usable here (cached)."""
+    global _AES_LIB, _AES_CHECKED
+    if _AES_CHECKED:
+        return _AES_LIB is not None
+    _AES_CHECKED = True
+    try:
+        import ctypes
+    except ImportError:
+        return False
+    for path in _libcrypto_candidates():
+        if sys.platform == "darwin" and path.startswith("/usr/lib/"):
+            continue
+        try:
+            lib = ctypes.CDLL(path)
+            vp, ci = ctypes.c_void_p, ctypes.c_int
+            lib.EVP_CIPHER_CTX_new.restype  = vp
+            lib.EVP_CIPHER_CTX_new.argtypes = []
+            lib.EVP_CIPHER_CTX_free.restype  = None
+            lib.EVP_CIPHER_CTX_free.argtypes = [vp]
+            lib.EVP_aes_256_ctr.restype  = vp
+            lib.EVP_aes_256_ctr.argtypes = []
+            lib.EVP_EncryptInit_ex.restype  = ci
+            lib.EVP_EncryptInit_ex.argtypes = [vp, vp, vp, ctypes.c_char_p, ctypes.c_char_p]
+            lib.EVP_EncryptUpdate.restype  = ci
+            lib.EVP_EncryptUpdate.argtypes = [vp, ctypes.c_char_p, ctypes.POINTER(ci),
+                                              ctypes.c_char_p, ci]
+            _AES_LIB = lib
+            ok = _AesCtr(_AES_KAT_KEY).xor_iv(_AES_KAT_IV, _AES_KAT_PT) == _AES_KAT_CT
+        except Exception:
+            ok = False
+        if ok:
+            _vprint(f"  AES-256 available (OpenSSL via {os.path.basename(path)}).")
+            return True
+        _AES_LIB = None
+    _vprint("  AES-256 not available here (OpenSSL not found); using the SHA-256 cipher.")
+    return False
+
+
+class _AesCtr:
+    """AES-256-CTR keystream for one key. Counter block = 8-byte packet
+    nonce || 8-byte big-endian block index (same as p2p.ps1)."""
+
+    def __init__(self, key: bytes):
+        import ctypes
+        self._ctypes = ctypes
+        self._lib = lib = _AES_LIB
+        self._ctx = lib.EVP_CIPHER_CTX_new()
+        if not self._ctx:
+            raise MemoryError("EVP_CIPHER_CTX_new failed")
+        if lib.EVP_EncryptInit_ex(self._ctx, lib.EVP_aes_256_ctr(), None, key, None) != 1:
+            raise ValueError("EVP_EncryptInit_ex failed")
+
+    def __del__(self):
+        ctx, self._ctx = getattr(self, "_ctx", None), None
+        if ctx:
+            try:
+                self._lib.EVP_CIPHER_CTX_free(ctx)
+            except Exception:
+                pass
+
+    def xor_iv(self, iv: bytes, data: bytes) -> bytes:
+        if not data:
+            return b""
+        ct = self._ctypes
+        if self._lib.EVP_EncryptInit_ex(self._ctx, None, None, None, iv) != 1:
+            raise ValueError("EVP_EncryptInit_ex failed")
+        out  = ct.create_string_buffer(len(data))
+        outl = ct.c_int(0)
+        if (self._lib.EVP_EncryptUpdate(self._ctx, out, ct.byref(outl), data, len(data)) != 1
+                or outl.value != len(data)):
+            raise ValueError("EVP_EncryptUpdate failed")
+        return out.raw
+
+    def xor(self, nonce: bytes, data: bytes) -> bytes:
+        return self.xor_iv(nonce + b"\0" * 8, data)
+
+
 class Cipher:
     """
     Symmetric authenticated encryption using only hashlib + hmac.
 
     Key derivation : PBKDF2-HMAC-SHA256 (100 000 rounds) -> 128 bytes
                      split into sender->receiver and receiver->sender key pairs.
-    Encryption     : SHA-256 in counter mode (XOR keystream).
-    Authentication : HMAC-SHA-256 truncated to 128 bits per packet.
+    Encryption     : AES-256-CTR when both sides can (aes=True), else
+                     SHA-256 in counter mode (XOR keystream).
+    Authentication : HMAC-SHA-256 truncated to 128 bits per packet
+                     (encrypt-then-MAC, same packet format either way).
 
     Each direction gets its own (enc_key, mac_key) so both sides can use
     an independent monotonic counter as nonce without collision.
     """
 
-    def __init__(self, secret: bytes, salt: bytes, is_sender: bool):
+    def __init__(self, secret: bytes, salt: bytes, is_sender: bool, aes: bool = False):
         km = hashlib.pbkdf2_hmac("sha256", secret, salt, 100_000, dklen=128)
         s2r_enc, s2r_mac = km[:32],   km[32:64]
         r2s_enc, r2s_mac = km[64:96], km[96:128]
@@ -504,6 +655,9 @@ class Cipher:
         else:
             self._ek, self._mk  = r2s_enc, r2s_mac
             self._dk, self._dmk = s2r_enc, s2r_mac
+
+        self._aes_e = _AesCtr(self._ek) if aes else None
+        self._aes_d = _AesCtr(self._dk) if aes else None
 
         self._ctr = 0
         self._max_nonce = -1
@@ -532,7 +686,10 @@ class Cipher:
     def encrypt(self, ptype: int, plaintext: bytes) -> bytes:
         nonce = struct.pack(">Q", self._ctr)
         self._ctr += 1
-        ct     = self._xor(plaintext, self._keystream(self._ek, nonce, len(plaintext)))
+        if self._aes_e:
+            ct = self._aes_e.xor(nonce, plaintext)
+        else:
+            ct = self._xor(plaintext, self._keystream(self._ek, nonce, len(plaintext)))
         header = struct.pack("B", ptype) + nonce
         mac    = _hmac.new(self._mk, header + ct, hashlib.sha256).digest()[:16]
         return header + ct + mac
@@ -563,6 +720,8 @@ class Cipher:
             if len(self._nonce_window) > 2 * self._NONCE_WINDOW:
                 new_floor = max(self._max_nonce - self._NONCE_WINDOW + 1, 0)
                 self._nonce_window = {n for n in self._nonce_window if n >= new_floor}
+        if self._aes_d:
+            return ptype, self._aes_d.xor(nonce, ct)
         pt = self._xor(ct, self._keystream(self._dk, nonce, len(ct)))
         return ptype, pt
 
@@ -1459,6 +1618,7 @@ PAKE_REPLY_GAP = 1.0    # seconds; min gap between replies to a peer's repeats
 _PAKE_VERSION  = 1
 _PAKE_F_RELAY  = 1      # flag: this side asked for --relay
 _PAKE_F_IPV6   = 2      # flag: this side uses -6
+_PAKE_F_AES    = 4      # flag: this side can do AES-256-CTR
 _PAKE_MAGIC    = b"SPK1"
 
 _SPAKE_Q = (_DH_P - 1) // 2
@@ -2543,7 +2703,9 @@ def _pake_connect(code, is_sender, sock, local_ip, local_port, connect_timeout):
     relay mode. Exits on failure.
     """
     nameplate, password = parse_pake_code(code)
-    my_flags = (_PAKE_F_RELAY if USE_RELAY else 0) | (_PAKE_F_IPV6 if USE_IPV6 else 0)
+    global USE_AES
+    my_flags = ((_PAKE_F_RELAY if USE_RELAY else 0) | (_PAKE_F_IPV6 if USE_IPV6 else 0)
+                | (_PAKE_F_AES if _aes_available() else 0))
     other = "receiver" if is_sender else "sender"
     sess = PakeSession(nameplate, password, is_sender)
     try:
@@ -2564,6 +2726,12 @@ def _pake_connect(code, is_sender, sock, local_ip, local_port, connect_timeout):
             sock.close()
             sys.exit(1)
         print("  Code verified.")
+        USE_AES = bool(my_flags & peer_flags & _PAKE_F_AES)
+        if USE_AES:
+            print("  Encryption: AES-256-CTR + HMAC-SHA256.")
+        else:
+            where = "this machine" if not my_flags & _PAKE_F_AES else f"the {other}'s machine"
+            print(f"  Encryption: SHA-256-CTR + HMAC-SHA256 (AES isn't available on {where}).")
 
         if (my_flags | peer_flags) & _PAKE_F_RELAY:
             if not USE_RELAY:
@@ -2711,7 +2879,7 @@ def cmd_send(filepath, connect_timeout=CONNECT_TIMEOUT, long_code=False):
 
     # ---- Handshake ----------------------------------------------------------
     _vprint("  Deriving handshake keys (PBKDF2, 100k rounds)...")
-    handshake_cipher = Cipher(secret, salt, is_sender=True)
+    handshake_cipher = Cipher(secret, salt, is_sender=True, aes=USE_AES)
     dh_priv, dh_pub  = _dh_keypair()
 
     relay_sock = None
@@ -2777,7 +2945,7 @@ def cmd_send(filepath, connect_timeout=CONNECT_TIMEOUT, long_code=False):
         sys.exit(1)
 
     _vprint("  Forward-secret session keys established (DH + PBKDF2).")
-    session_cipher = Cipher(secret + dh_shared, salt, is_sender=True)
+    session_cipher = Cipher(secret + dh_shared, salt, is_sender=True, aes=USE_AES)
 
     # ---- Transfer -----------------------------------------------------------
     xfer_sock = relay_sock if relay_sock else sock
@@ -2899,7 +3067,7 @@ def cmd_recv(connect_timeout=CONNECT_TIMEOUT, max_size=MAX_FILE_SIZE, resume_pat
 
     # ---- Handshake ----------------------------------------------------------
     _vprint("  Deriving handshake keys (PBKDF2, 100k rounds)...")
-    handshake_cipher = Cipher(secret, salt, is_sender=False)
+    handshake_cipher = Cipher(secret, salt, is_sender=False, aes=USE_AES)
     dh_priv, dh_pub  = _dh_keypair()
 
     relay_sock = None
@@ -2965,7 +3133,7 @@ def cmd_recv(connect_timeout=CONNECT_TIMEOUT, max_size=MAX_FILE_SIZE, resume_pat
         sys.exit(1)
 
     _vprint("  Forward-secret session keys established (DH + PBKDF2).")
-    session_cipher = Cipher(secret + dh_shared, salt, is_sender=False)
+    session_cipher = Cipher(secret + dh_shared, salt, is_sender=False, aes=USE_AES)
 
     # ---- Receive ------------------------------------------------------------
     xfer_sock = relay_sock if relay_sock else sock

@@ -69,12 +69,9 @@ function progress(done, total, bps) {
   status(done < total ? (sendingMode ? "Sending…" : "Receiving…") : "Finishing…");
 }
 
+// Which transport is in use is an implementation detail: log it, don't show it.
 function connected(kind) {
-  $("transport").hidden = false;
-  $("transport").textContent = kind === "webrtc" ? "Direct connection" : "Through the relay";
-  $("transport").title = kind === "webrtc"
-    ? "The file goes straight between the two browsers (WebRTC)."
-    : "The file goes through the relay. It is end-to-end encrypted, so the relay can't read it.";
+  console.info(`Connected via ${kind === "webrtc" ? "WebRTC (direct)" : "the relay"}.`);
 }
 
 let sendingMode = true;

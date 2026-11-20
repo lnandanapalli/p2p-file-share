@@ -17,7 +17,7 @@ Plain HTML and JavaScript: no frameworks, no npm, no third-party code. The conta
 | Connect | The WebRTC offer/answer is sent **encrypted under the SPAKE2 key**. That ties WebRTC's own encryption (DTLS) to the code, so the relay can't sit in the middle. The **sender** decides: WebRTC if its data channel opens within 10 s, otherwise the relay. It tells the receiver, so both always agree. |
 | Transfer | Every message is encrypted with **AES-GCM** (separate key per direction), numbered and acknowledged, over whichever transport was chosen. The receiver accepts or declines first, and confirms when the file is saved. |
 
-**Relay only** (a checkbox on either side) skips WebRTC: the other side then never learns your IP address. WebRTC normally reveals each side's IP address to the other, as any direct connection does.
+**Hide my IP address** (a checkbox on either side, "relay only") skips WebRTC: the other side then never learns your IP address. WebRTC normally reveals each side's IP address to the other, as any direct connection does.
 
 There is no TURN server: when two networks can't connect directly, the relay plays that role, with the same end-to-end encryption.
 

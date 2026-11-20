@@ -251,7 +251,7 @@ export function startSend(file, opts, ui) {
   const ctl = { cancelled: false, stream: null, rdv: null };
   ctl.cancel = () => cancel(ctl);
   ctl.result = (async () => {
-    if (!(await relayReachable(RELAY_URL))) throw new Error("Can't reach the relay. Check your internet connection.");
+    if (!(await relayReachable(RELAY_URL))) throw new Error("Can't connect right now. Check your internet connection and try again.");
     const code = C.makeCode();
     const { nameplate, password } = C.parseCode(code);
     const spake = await C.Spake2.create(password, true);
@@ -325,7 +325,7 @@ export function startReceive(codeText, opts, ui) {
   ctl.cancel = () => cancel(ctl);
   ctl.result = (async () => {
     const { nameplate, password } = C.parseCode(codeText);
-    if (!(await relayReachable(RELAY_URL))) throw new Error("Can't reach the relay. Check your internet connection.");
+    if (!(await relayReachable(RELAY_URL))) throw new Error("Can't connect right now. Check your internet connection and try again.");
     const spake = await C.Spake2.create(password, false);
     const rdv = (ctl.rdv = new Rendezvous(await C.mailboxToken(nameplate), false));
     let sink = null, pc = null;
@@ -376,7 +376,7 @@ export function startReceive(codeText, opts, ui) {
       let pipe;
       if (decision === "webrtc") {
         pipe = rtcPipe && (await Promise.race([rtcPipe, sleep(15000).then(() => null)]));
-        if (!pipe) throw new Error("The direct connection failed. Try again with “Relay only”.");
+        if (!pipe) throw new Error("Couldn't connect to the sender. Please try again.");
       } else {
         rtcDiag(pc, "sender chose the relay");
         try { pc && pc.close(); } catch {}

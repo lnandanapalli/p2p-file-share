@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
 <title>Share a file</title>
-<meta name="description" content="Send a file to another browser with a short code. End-to-end encrypted, directly between browsers when possible.">
+<meta name="description" content="Send a file to anyone with a short code. End-to-end encrypted.">
 <style>
   :root {
     --bg: #f4f5f7; --card: #ffffff; --text: #1d2330; --muted: #5d6677; --line: #dde1e8;
@@ -82,10 +82,6 @@
   .progress { height: 8px; background: var(--bg); border-radius: 99px; overflow: hidden; margin: 12px 0 6px; }
   .progress > div { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
   #detail { color: var(--muted); font-size: .88rem; margin: 0; font-variant-numeric: tabular-nums; }
-  .badge {
-    display: inline-block; font-size: .78rem; font-weight: 600; padding: 2px 8px; border-radius: 99px;
-    background: var(--soft); color: var(--accent); margin-top: 10px;
-  }
   .actions { margin-top: 16px; }
   footer { max-width: 520px; color: var(--muted); font-size: .85rem; margin-top: 18px; padding: 0 4px; }
   footer a { color: inherit; }
@@ -95,7 +91,7 @@
 <body>
 <main>
   <h1>Share a file</h1>
-  <p class="sub">End-to-end encrypted. Goes directly between browsers when it can.</p>
+  <p class="sub">Send a file to anyone with a short code. End-to-end encrypted.</p>
 
   <div class="tabs" role="tablist">
     <button id="tab-send" role="tab" aria-selected="true">Send</button>
@@ -109,7 +105,7 @@
         <strong>Choose a file</strong> or drop it here
       </label>
       <label class="opt"><input type="checkbox" id="send-relay">
-        <span>Relay only: always go through the relay, so the receiver never sees your IP address (can be slower)</span></label>
+        <span>Hide my IP address from the receiver (may be slower)</span></label>
     </div>
     <div id="send-info" hidden>
       <p class="file-line" id="send-file"></p>
@@ -132,7 +128,7 @@
       <button class="primary" id="recv-btn" type="submit">Receive</button>
     </form>
     <label class="opt"><input type="checkbox" id="recv-relay">
-      <span>Relay only: always go through the relay, so the sender never sees your IP address (can be slower)</span></label>
+      <span>Hide my IP address from the sender (may be slower)</span></label>
     <div class="offer" id="offer" hidden>
       <p class="name" id="offer-name"></p>
       <p class="size" id="offer-size"></p>
@@ -150,7 +146,6 @@
     <div class="progress" id="progress" hidden><div id="bar"></div></div>
     <p id="detail"></p>
     <p class="note" id="save-again" hidden></p>
-    <span class="badge" id="transport" hidden></span>
     <div class="actions row">
       <button class="secondary" id="cancel" hidden>Cancel</button>
       <button class="primary" id="again" hidden>Start over</button>
@@ -158,10 +153,7 @@
   </div>
 </main>
 <footer>
-  The code's number finds the other browser through a relay; its words are checked with SPAKE2,
-  so nobody else can use them to read your file. The file is encrypted with AES-GCM, and goes
-  directly between the browsers (WebRTC) when possible, otherwise through the relay, which only
-  ever sees encrypted data.
+  Your file is end-to-end encrypted. Only the person with your code can open it.
 </footer>
 <script type="module" src="app.js"></script>
 </body>
